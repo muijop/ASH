@@ -1,0 +1,538 @@
+import os
+import re
+import glob
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from tqdm import tqdm
+import sentencepiece as spm导入sentencepiece as spm
+import random导入random
+
+# ===================== 固定随机种子，保证可复现 =====================
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ===================== 基础配置 =====================
+# 模型结构参数
+VOCAB_SIZE = 32000
+EMBED_DIM = 512
+NUM_Q_HEADS = 8
+NUM_KV_HEADS = 2
+NUM_LAYERS = 8
+MAX_SEQ_LEN = 512
+FFN_EXPANSION_RATIO = 2.67
+
+# 训练参数
+BATCH_SIZE = 2
+BASE_LR = 1.5e-4
+WEIGHT_DECAY = 0.01
+MAX_GRAD_NORM = 1.0
+MIN_EPOCHS_PER_CORPUS = 2
+MAX_EPOCHS_PER_CORPUS = 5
+EARLY_STOP_PATIENCE = 2  # 验证集2轮不下降就早停
+WARMUP_STEPS = 50
+VAL_RATIO = 0.05  # 验证集占比5%
+
+# 路径配置（代码同级目录）
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_SAVE_DIR = os.path.join(CURRENT_DIR, "model_save")
+TOKENIZER_DIR = os.path.join(CURRENT_DIR, "tokenizer_model")
+LOG_FILE = os.path.join(CURRENT_DIR, "train_full_log.log")
+TEMP_CKPT_PATH = os.path.join(MODEL_SAVE_DIR, "temp_ckpt.pth")
+FINAL_MODEL_PATH = os.path.join(MODEL_SAVE_DIR, "final_model.pth")
+TOKENIZER_MODEL_PATH = os.path.join(TOKENIZER_DIR, "spm_tokenizer.model")
+
+# CPU专属配置
+DEVICE = torch.device("cpu")
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
+os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
+torch.set_num_threads(os.cpu_count())
+torch.set_num_interop_threads(os.cpu_count())
+torch.set_float32_matmul_precision("medium")
+
+# 自动创建文件夹
+os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+os.makedirs(TOKENIZER_DIR, exist_ok=True)
+
+# 日志写入
+def write_log(content):
+    print(content)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{content}\n")
+
+# ===================== 模型核心模块 =====================
+# 归一化层
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+# 旋转位置编码 RoPE
+class RoPE(nn.Module):
+    def __init__(self, head_dim: int, max_seq_len: int, base: int = 10000):
+        super().__init__()
+        theta = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        seq_idx = torch.arange(max_seq_len).float()
+        freqs = torch.outer(seq_idx, theta)
+        self.register_buffer("cos", freqs.cos()[None, None, :, :])
+        self.register_buffer("sin", freqs.sin()[None, None, :, :])
+
+    def forward(self, x: torch.Tensor):
+        seq_len = x.shape[2]
+        cos = self.cos[:, :, :seq_len, :].to(x.dtype)
+        sin = self.sin[:, :, :seq_len, :].to(x.dtype)
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+# 分组查询注意力 GQA
+class GQAAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.head_dim = EMBED_DIM // NUM_Q_HEADS
+        self.num_q_heads = NUM_Q_HEADS
+        self.num_kv_heads = NUM_KV_HEADS
+        self.kv_repeat = self.num_q_heads // self.num_kv_heads
+
+        self.q_proj = nn.Linear(EMBED_DIM, self.num_q_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(EMBED_DIM, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(EMBED_DIM, self.num_kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
+
+        self.rope = RoPE(self.head_dim, MAX_SEQ_LEN)
+        self.register_buffer("causal_mask", torch.tril(torch.ones(1, 1, MAX_SEQ_LEN, MAX_SEQ_LEN)))
+
+    def forward(self, x: torch.Tensor):
+        batch_size, seq_len, _ = x.shape
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        k = k.repeat_interleave(self.kv_repeat, dim=1)
+        v = v.repeat_interleave(self.kv_repeat, dim=1)
+
+        attn_scores = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn_scores = attn_scores.masked_fill(self.causal_mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
+
+        # 稀疏优化，降低CPU计算量
+        top_k = min(32, seq_len)
+        top_k_values, _ = torch.topk(attn_scores, top_k, dim=-1)
+        attn_scores = attn_scores.masked_fill(attn_scores < top_k_values[..., -1, None], float("-inf"))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_output = (attn_weights @ v).transpose(1, 2).contiguous().view(batch_size, seq_len, EMBED_DIM)
+        return self.out_proj(attn_output)
+
+# SwiGLU 前馈网络
+class SwiGLUFFN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        hidden_dim = int(EMBED_DIM * FFN_EXPANSION_RATIO)
+        self.w1 = nn.Linear(EMBED_DIM, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, EMBED_DIM, bias=False)
+        self.w3 = nn.Linear(EMBED_DIM, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+# ===================== 2026最新Block级超残差连接Decoder层 =====================
+class HyperResDecoderLayer(nn.Module):
+    def __init__(self, is_trainable: bool = True):
+        super().__init__()
+        self.attn_norm = RMSNorm(EMBED_DIM)
+        self.attn = GQAAttention()
+        self.ffn_norm = RMSNorm(EMBED_DIM)
+        self.ffn = SwiGLUFFN()
+        
+        # 局部残差可学习缩放系数
+        self.res_scale = nn.Parameter(torch.ones(1) * 0.1)
+        # 层是否可训练
+        self.is_trainable = is_trainable
+        if not is_trainable:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def forward(self, x: torch.Tensor):
+        if self.is_trainable:
+            # 标准局部残差连接
+            attn_out = x + self.attn(self.attn_norm(x)) * self.res_scale
+            ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out)) * self.res_scale
+        else:
+            with torch.no_grad():
+                attn_out = x + self.attn(self.attn_norm(x)) * self.res_scale
+                ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out)) * self.res_scale
+        return ffn_out
+
+# ===================== 完整大语言模型（带全局超残差连接） =====================
+class HyperResLLModel(nn.Module):
+    def __init__(self, trainable_layers: list = None):
+        super().__init__()
+        self.token_embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
+        
+        # 动态设置可训练层
+        if trainable_layers is None:
+            trainable_layers = list(range(NUM_LAYERS))
+        self.decoder_layers = nn.ModuleList([
+            HyperResDecoderLayer(is_trainable=(i in trainable_layers))
+            for i in range(NUM_LAYERS)
+        ])
+        
+        self.final_norm = RMSNorm(EMBED_DIM)
+        self.lm_head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
+        # 权重共享，减少参数量
+        self.token_embedding.weight = self.lm_head.weight
+
+    def forward(self, input_ids: torch.Tensor):
+        x = self.token_embedding(input_ids)
+        # 全局超残差连接：每2层传递一次全局残差信号
+        global_res = x
+        for idx, layer in enumerate(self.decoder_layers):
+            x = layer(x)
+            # 每2层注入一次全局残差，解决信息稀释问题
+            if (idx + 1) % 2 == 0:
+                x = x + global_res * 0.05
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        return logits
+
+# ===================== 修正版 SophiaH 优化器 =====================
+class SophiaH(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-4, betas=(0.965, 0.99), rho=0.04, weight_decay=0.01, eps=1e-12):
+        defaults = dict(lr=lr, betas=betas, rho=rho, weight_decay=weight_decay, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, hessian=None):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+                    state['hessian'] = torch.zeros_like(p)
+
+                exp_avg, exp_avg_sq, hessian_est = state['exp_avg'], state['exp_avg_sq'], state['hessian']
+                beta1, beta2 = group['betas']
+                rho = group['rho']
+                lr = group['lr']
+                weight_decay = group['weight_decay']
+
+                state['step'] += 1
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+
+                if weight_decay != 0:
+                    p.mul_(1 - lr * weight_decay)
+
+                if hessian is not None:
+                    hessian_est.mul_(beta2).add_(hessian, alpha=1 - beta2)
+
+                if state['step'] % 10 == 0 and hessian is not None:
+                    update = exp_avg / (rho * torch.clamp(hessian_est, min=group['eps']) + group['eps'])
+                else:
+                    update = exp_avg / (torch.sqrt(exp_avg_sq) + group['eps'])
+
+                p.add_(update, alpha=-lr)
+        return
+
+# ===================== 数据处理工具 =====================
+# 自动扫描语料文件
+def auto_scan_corpus():
+    all_txt_files = glob.glob(os.path.join(CURRENT_DIR, "*.txt"))
+    corpus_pattern = re.compile(r"^(\d+)\.txt$")
+    corpus_list = []
+    for file_path in all_txt_files:
+        file_name = os.path.basename(file_path)
+        match = corpus_pattern.match(file_name)
+        if match:
+            num = int(match.group(1))
+            corpus_list.append((num, file_path))
+    corpus_list.sort(key=lambda x: x[0])
+    sorted_corpus = [x[1] for x in corpus_list]
+
+    if len(sorted_corpus) == 0:
+        raise FileNotFoundError("未找到 1.txt、2.txt 等数字命名的文本语料")
+
+    write_log(f"检测到{len(sorted_corpus)}个语料文件，将按顺序依次训练：")
+    for path in sorted_corpus:
+        write_log("   " + os.path.basename(path))
+    return sorted_corpus
+
+# 加载/训练分词器
+def get_tokenizer(corpus_list):
+    if os.path.exists(TOKENIZER_MODEL_PATH):
+        sp = spm.SentencePieceProcessor(model_file=TOKENIZER_MODEL_PATH)
+        write_log("加载已存在的分词器")
+        return sp
+    else:
+        write_log("初次运行，开始训练分词器")
+        all_text = ""
+        for path in corpus_list:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                all_text += f.read() + "\n"
+        temp_file = os.path.join(TOKENIZER_DIR, "temp.txt")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(all_text)
+
+        spm.SentencePieceTrainer.train(
+            input=temp_file,
+            model_prefix=os.path.join(TOKENIZER_DIR, "spm_tokenizer"),
+            vocab_size=VOCAB_SIZE,
+            character_coverage=0.9995,
+            model_type="bpe"
+        )
+        os.remove(temp_file)
+        sp = spm.SentencePieceProcessor(model_file=TOKENIZER_MODEL_PATH)
+        write_log("分词器训练完成")
+        return sp
+
+# 语料清洗+训练集/验证集划分
+def load_and_split_corpus(corpus_path, tokenizer, val_ratio=VAL_RATIO):
+    # 读取并清洗语料
+    with open(corpus_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    valid_paragraphs = []
+    para_set = set()
+    current_para = ""
+    for line in lines:
+        line = line.strip()
+        if len(line) == 0:
+            if len(current_para) > 50 and current_para not in para_set:
+                para_set.add(current_para)
+                valid_paragraphs.append(current_para)
+            current_para = ""
+        else:
+            current_para += line + " "
+    if len(current_para) > 50 and current_para not in para_set:
+        valid_paragraphs.append(current_para)
+    
+    if len(valid_paragraphs) == 0:
+        raise ValueError(f"语料{os.path.basename(corpus_path)}无有效数据")
+    
+    # 按段落划分训练集和验证集，避免数据泄露
+    random.shuffle(valid_paragraphs)
+    split_idx = int(len(valid_paragraphs) * (1 - val_ratio))
+    train_paras = valid_paragraphs[:split_idx]
+    val_paras = valid_paragraphs[split_idx:]
+    write_log(f"语料划分完成：训练集{len(train_paras)}段，验证集{len(val_paras)}段")
+
+    # 转token张量
+    def paras_to_tensor(paras):
+        all_ids = []
+        for para in paras:
+            all_ids.extend(tokenizer.encode(para, out_type=int))
+        chunks = []
+        for i in range(0, len(all_ids)-MAX_SEQ_LEN, MAX_SEQ_LEN):
+            chunk = all_ids[i:i+MAX_SEQ_LEN]
+            if len(chunk) == MAX_SEQ_LEN:
+                chunks.append(chunk)
+        if not chunks:
+            return None
+        tensor = torch.tensor(chunks, dtype=torch.long)
+        return tensor[:, :-1], tensor[:, 1:]
+    
+    train_data = paras_to_tensor(train_paras)
+    val_data = paras_to_tensor(val_paras)
+    return train_data, val_data
+
+# 验证集评估函数
+def evaluate(model, val_data):
+    model.eval()
+    total_loss = 0.0
+    x_val, y_val = val_data
+    val_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x_val, y_val),
+        batch_size=BATCH_SIZE, shuffle=False
+    )
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            logits = model(x)
+            loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1))
+            total_loss += loss.item()
+    avg_loss = total_loss / len(val_loader)
+    ppl = torch.exp(torch.tensor(avg_loss)).item()
+    model.train()
+    return avg_loss, ppl
+
+# 断点续训加载
+def load_checkpoint(model, optimizer, scheduler):
+    start_corpus_idx = 0
+    start_epoch = 0
+    global_step = 0
+    best_ppl = float("inf")
+    if os.path.exists(TEMP_CKPT_PATH):
+        write_log("检测到断点，自动加载继续训练...")
+        ckpt = torch.load(TEMP_CKPT_PATH, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_corpus_idx = ckpt["corpus_idx"]
+        start_epoch = ckpt["epoch"]
+        global_step = ckpt["global_step"]
+        best_ppl = ckpt["best_ppl"]
+        write_log(f"断点加载完成，从第{start_corpus_idx+1}个语料继续")
+    return model, optimizer, scheduler, start_corpus_idx, start_epoch, global_step, best_ppl
+
+# 断点保存
+def save_checkpoint(model, optimizer, scheduler, corpus_idx, epoch, global_step, best_ppl):
+    ckpt = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "corpus_idx": corpus_idx,
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_ppl": best_ppl
+    }
+    torch.save(ckpt, TEMP_CKPT_PATH)
+
+# ===================== 单语料训练主流程 =====================
+def train_single_corpus(model, optimizer, scheduler, tokenizer, corpus_path, corpus_idx, total_corpus, global_step):
+    name = os.path.basename(corpus_path)
+    write_log(f"\n------ 开始训练第{corpus_idx+1}个语料：{name} ------")
+
+    # 动态设置可训练层：第一个语料全参数训练，后续增量训练首尾4层
+    if corpus_idx == 0:
+        trainable_layers = list(range(NUM_LAYERS))
+    else:
+        trainable_layers = list(range(2)) + list(range(NUM_LAYERS-2, NUM_LAYERS))
+    for i, layer in enumerate(model.decoder_layers):
+        layer.is_trainable = (i in trainable_layers)
+        for param in layer.parameters():
+            param.requires_grad = (i in trainable_layers)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    write_log(f"当前可训练层数：{len(trainable_layers)}，可训练参数量：{sum(p.numel() for p in trainable_params)/1e6:.2f}M")
+
+    # 加载并划分训练集/验证集
+    train_data, val_data = load_and_split_corpus(corpus_path, tokenizer)
+    if train_data is None or val_data is None:
+        write_log(f"❌ {name} 无有效训练数据，跳过")
+        return model, optimizer, scheduler, global_step
+
+    train_dataset = torch.utils.data.TensorDataset(*train_data)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=min(4, os.cpu_count())
+    )
+
+    # 早停初始化
+    best_ppl = float("inf")
+    patience_counter = 0
+    model.train()
+
+    for epoch in range(MAX_EPOCHS_PER_CORPUS):
+        epoch_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS_PER_CORPUS}")
+
+        for step, (x, y) in enumerate(pbar):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            optimizer.zero_grad()
+
+            # 前向传播
+            logits = model(x)
+            # 主损失+Z-Loss稳定训练
+            loss_token = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1), label_smoothing=0.05)
+            z_loss = 1e-4 * logits.pow(2).mean()
+            loss = loss_token + z_loss
+
+            # 反向传播
+            loss.backward()
+
+            # 自适应梯度裁剪
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            # Hessian估计
+            hessian = torch.square(loss_token.grad) if (global_step % 10 == 0 and loss_token.grad is not None) else None
+            # 优化器与学习率更新
+            optimizer.step(hessian=hessian)
+            scheduler.step()
+
+            global_step += 1
+            epoch_loss += loss.item()
+            avg_loss = epoch_loss / (step + 1)
+            pbar.set_postfix({"loss": round(avg_loss, 4), "grad_norm": round(grad_norm.item(), 4)})
+
+        # 每轮结束验证集评估
+        val_loss, val_ppl = evaluate(model, val_data)
+        train_avg_loss = epoch_loss / len(train_loader)
+        write_log(f"Epoch {epoch+1} 结束 | 训练Loss: {train_avg_loss:.6f} | 验证Loss: {val_loss:.6f} | 验证PPL: {val_ppl:.2f}")
+
+        # 早停判断
+        if val_ppl < best_ppl:
+            best_ppl = val_ppl
+            patience_counter = 0
+            # 保存最优模型
+            torch.save(model.state_dict(), os.path.join(MODEL_SAVE_DIR, f"best_model_{name}.pth"))
+        else:
+            patience_counter += 1
+            write_log(f"验证PPL未下降，耐心值：{patience_counter}/{EARLY_STOP_PATIENCE}")
+
+        # 达到最小轮数后触发早停
+        if epoch >= MIN_EPOCHS_PER_CORPUS and patience_counter >= EARLY_STOP_PATIENCE:
+            write_log(f"触发早停，停止训练{name}")
+            break
+
+        # 保存断点
+        save_checkpoint(model, optimizer, scheduler, corpus_idx, epoch+1, global_step, best_ppl)
+
+    # 语料训完保存最终模型
+    torch.save(model.state_dict(), os.path.join(MODEL_SAVE_DIR, f"model_{name}.pth"))
+    write_log(f"{name} 训练完成，最优验证PPL: {best_ppl:.2f}，模型已保存")
+    return model, optimizer, scheduler, global_step
+
+# ===================== 主程序入口 =====================
+if __name__ == "__main__":
+    write_log("======== 大语言模型预训练启动 =========")
+
+    # 1. 自动扫描语料
+    corpus_list = auto_scan_corpus()
+    total_corpus = len(corpus_list)
+
+    # 2. 加载分词器
+    tokenizer = get_tokenizer(corpus_list)
+
+    # 3. 初始化模型
+    model = HyperResLLModel().to(DEVICE)
+    # CPU算子编译优化
+    model = torch.compile(model, backend="inductor", dynamic=True)
+    write_log(f"模型初始化完成，总参数量：{sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+
+    # 4. 初始化优化器与学习率调度器
+    trainable_params = [p for p in model.parameters() if p.requires_grad]可训练参数 = [p for p in 模型参数 if p.requires_grad]
+    optimizer = SophiaH(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=1000, T_mult=2)
+
+    # 5. 加载断点
+    model, optimizer, scheduler, start_corpus_idx, start_epoch, global_step, best_ppl = load_checkpoint(model, optimizer, scheduler)
+
+    # 6. 顺序训练所有语料
+    for corpus_idx in range(start_corpus_idx, total_corpus):
+        corpus_path = corpus_list[corpus_idx]
+        # 跳过已训完的语料
+        if os.path.exists(os.path.join(MODEL_SAVE_DIR, f"model_{os.path.basename(corpus_path)}.pth")):
+            write_log(f"{os.path.basename(corpus_path)} 已训练完成，自动跳过")
+            continue
+        model, optimizer, scheduler, global_step = train_single_corpus(
+            model, optimizer, scheduler, tokenizer, corpus_path, corpus_idx, total_corpus, global_step
+        )
+
+    # 全部训完保存最终模型
+    torch.save(model.state_dict(), FINAL_MODEL_PATH)
+    # 删除临时断点
+    if os.path.exists(TEMP_CKPT_PATH):
+        os.remove(TEMP_CKPT_PATH)
+    write_log("\n======== 所有语料训练全部结束，最终模型已保存 =========")
+
