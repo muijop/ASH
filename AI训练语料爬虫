@@ -1,0 +1,349 @@
+import os
+import re
+import time
+import random
+import pickle
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+
+# ====================================== 爬虫核心配置（已按需求修改） ======================================
+# 种子URL（新浪网首页/频道入口，可按需增删）
+SEED_URLS = [
+    "https://www.sina.com.cn/",
+    "https://news.sina.com.cn/",
+    "https://finance.sina.com.cn/",
+    "https://tech.sina.com.cn/",
+    "https://sports.sina.com.cn/",
+    "https://ent.sina.com.cn/",
+    "https://edu.sina.com.cn/",
+    "https://mil.sina.com.cn/",
+    "https://travel.sina.com.cn/",
+    "https://health.sina.com.cn"
+]
+# 域名白名单（只爬取新浪网合规域名，防止外链跑飞）
+ALLOWED_DOMAINS = [
+    "sina.com.cn",
+    "news.sina.com.cn",
+    "finance.sina.com.cn",
+    "tech.sina.com.cn",
+    "sports.sina.com.cn",
+    "ent.sina.com.cn",
+    "edu.sina.com.cn",
+    "mil.sina.com.cn",
+    "travel.sina.com.cn",
+    "health.sina.com.cn",
+    "auto.sina.com.cn",
+    "fashion.sina.com.cn"
+]
+# 爬取核心配置
+MAX_CRAWL_DEPTH = 6  # 最大爬取深度（从种子URL开始计算）
+MAX_CRAWL_COUNT = 1000000  # 最大爬取页面数（百万级，足够生成大量语料）
+CRAWL_MODE = "breadth"  # 爬取模式：breadth=广度优先（推荐，覆盖更广），depth=深度优先
+REQUEST_DELAY_MIN = 0.8  # 请求最小间隔（秒），请勿调太低避免被封IP
+REQUEST_DELAY_MAX = 2  # 请求最大间隔（秒）
+# 【核心修改】单文件保存条数：每个txt文件固定保存5000条有效文章
+SAVE_CHUNK_SIZE = 5000
+# 路径配置（和训练代码同级目录，自动适配）
+SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 断点续爬配置（中断后重开自动续爬，无需从头开始）
+CRAWL_STATE_PATH = os.path.join(SAVE_DIR, "crawl_state.pkl")
+# 请求头（模拟浏览器，反爬规避）
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+]
+# 禁止爬取路径（遵守robots协议，过滤非内容页面）
+FORBIDDEN_PATHS = [
+    "/admin", "/search", "/api", "/login", "/register",
+    "/user", "/pay", "/vip", "/comment", "/live", "/video",
+    "/download", "/img", "/pic", "/attachment", "/special"
+]
+# 正文提取标签白名单（精准提取文章内容，过滤广告/导航/侧边栏）
+CONTENT_TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "div.article", "div.content", "div.main-content", "div.article-content"]
+# 无效内容过滤正则（彻底过滤广告、版权、推广等无关内容）
+INVALID_CONTENT_REGEX = re.compile(
+    r"广告|推广|免责声明|版权所有|新浪声明|未经许可|转载请注明|关注我们|微信公众号|扫码|点击查看|更多精彩内容|来源：|编辑：|责任编辑：",
+    re.IGNORECASE
+)
+
+# ====================================== 爬虫核心工具函数 ======================================
+def get_headers():
+    """生成随机请求头，规避反爬"""
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.sina.com.cn/"
+    }
+
+def is_allowed_url(url):
+    """校验URL合法性，只爬取新浪网合规内容页面"""
+    parsed = urlparse(url)
+    # 域名白名单校验
+    domain_allowed = False
+    for allowed_domain in ALLOWED_DOMAINS:
+        if parsed.netloc.endswith(allowed_domain):
+            domain_allowed = True
+            break
+    if not domain_allowed:
+        return False
+    # 禁止路径校验
+    for forbidden_path in FORBIDDEN_PATHS:
+        if forbidden_path in parsed.path.lower():
+            return False
+    # 过滤非HTML资源（图片、视频、JS、CSS等）
+    if parsed.path.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".js", ".css", ".pdf", ".zip", ".rar", ".mp4", ".mp3", ".exe")):
+        return False
+    return True
+
+def extract_links(soup, base_url):
+    """从页面提取所有合法内链，用于深度/广度爬取"""
+    links = set()
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"].strip()
+        # 相对路径转绝对路径
+        full_url = urljoin(base_url, href)
+        # 去除URL锚点，避免重复爬取
+        full_url = full_url.split("#")[0].strip().rstrip("/")
+        # 过滤非法URL
+        if is_allowed_url(full_url) and full_url.startswith(("http://", "https://")):
+            links.add(full_url)
+    return list(links)
+
+def clean_content(text):
+    """清洗文本内容，生成符合预训练要求的纯净语料"""
+    # 去除多余空白符、换行符
+    text = re.sub(r"\s+", " ", text).strip()
+    # 替换HTML特殊字符为中文标准符号
+    text = text.replace("&nbsp;", " ").replace("&ldquo;", "“").replace("&rdquo;", "”")
+    text = text.replace("&mdash;", "—").replace("&hellip;", "…").replace("\u3000", " ")
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    # 按句子过滤无效内容
+    sentences = re.split(r"([。！？；\n])", text)
+    valid_sentences = []
+    for i in range(0, len(sentences)-1, 2):
+        sentence = sentences[i].strip() + sentences[i+1].strip()
+        # 过滤过短句子、无效内容句子
+        if len(sentence) < 10:
+            continue
+        if INVALID_CONTENT_REGEX.search(sentence):
+            continue
+        valid_sentences.append(sentence)
+    # 合并纯净内容
+    clean_text = "".join(valid_sentences)
+    # 过滤过短的无效文章
+    if len(clean_text) < 50:
+        return None
+    return clean_text
+
+def extract_article_content(soup):
+    """精准提取页面正文，过滤广告、导航、侧边栏等无关内容"""
+    article_content = []
+    # 优先提取article标准标签（新浪新闻正文通用标签）
+    article_tag = soup.find("article")
+    if article_tag:
+        for content_tag in article_tag.find_all(CONTENT_TAGS):
+            text = content_tag.get_text(strip=True)
+            if text and len(text) > 10:
+                article_content.append(text)
+    # 无article标签时，提取正文段落
+    if not article_content:
+        for p_tag in soup.find_all("p"):
+            # 过滤导航、广告、页脚的段落
+            parent_attrs = str(p_tag.parent.get("class", [])) + str(p_tag.parent.get("id", ""))
+            if any(keyword in parent_attrs.lower() for keyword in ["nav", "header", "footer", "sidebar", "ad", "advert", "comment", "recommend"]):
+                continue
+            text = p_tag.get_text(strip=True)
+            if len(text) > 15:
+                article_content.append(text)
+    # 合并并清洗正文
+    raw_content = "\n".join(article_content)
+    return clean_content(raw_content)
+
+def save_corpus(articles, chunk_index):
+    """保存语料到txt文件，完全适配训练代码格式"""
+    file_path = os.path.join(SAVE_DIR, f"{chunk_index}.txt")
+    # 追加模式写入，避免内存溢出，同时保证单文件5000条
+    with open(file_path, "w", encoding="utf-8") as f:
+        for article in articles:
+            # 每篇文章单独分段，空行分隔，完全匹配训练代码的语料读取规则
+            f.write(article + "\n\n")
+    print(f"\n✅ 预训练语料保存完成：{os.path.basename(file_path)}")
+    print(f"📊 文件包含有效文章数：{len(articles)}，文件路径：{file_path}")
+
+def save_crawl_state(visited_urls, crawl_queue, current_depth, article_count, chunk_index, current_cache):
+    """保存爬取全状态，断点续爬零数据丢失"""
+    state = {
+        "visited_urls": visited_urls,
+        "crawl_queue": crawl_queue,
+        "current_depth": current_depth,
+        "article_count": article_count,
+        "chunk_index": chunk_index,
+        "current_cache": current_cache  # 新增：保存未写满5000条的缓存，断点不丢数据
+    }
+    with open(CRAWL_STATE_PATH, "wb") as f:
+        pickle.dump(state, f)
+
+def load_crawl_state():
+    """加载爬取断点，中断后自动续爬"""
+    if os.path.exists(CRAWL_STATE_PATH):
+        with open(CRAWL_STATE_PATH, "rb") as f:
+            state = pickle.load(f)
+        print(f"\n🔄 检测到爬取断点，已成功加载")
+        print(f"📊 已爬取页面数：{len(state['visited_urls'])}，已生成语料文件：{state['chunk_index']-1}个")
+        print(f"📦 断点缓存有效文章数：{len(state['current_cache'])}条")
+        return (
+            state["visited_urls"],
+            state["crawl_queue"],
+            state["current_depth"],
+            state["article_count"],
+            state["chunk_index"],
+            state["current_cache"]
+        )
+    else:
+        # 初始化爬取队列：(URL, 爬取深度)
+        init_queue = []
+        for seed_url in SEED_URLS:
+            init_queue.append((seed_url.rstrip("/"), 0))
+        print("✅ 无历史断点，初始化全新爬取任务")
+        return set(), init_queue, 0, 0, 1, []
+
+# ====================================== 主爬取流程 ======================================
+if __name__ == "__main__":
+    print("="*60)
+    print("新浪网预训练语料爬虫（单文件5000条版）")
+    print("="*60)
+
+    # 加载断点状态
+    visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, current_articles = load_crawl_state()
+
+    # 进度条配置
+    pbar = tqdm(
+        total=MAX_CRAWL_COUNT,总数=最大爬取次数,
+        initial=len(visited_urls),
+        desc="总爬取进度",
+        unit="页",
+        leave=True
+    )
+
+    # 配置信息打印
+    print(f"\n📌 爬取模式：{CRAWL_MODE}优先")
+    print(f"📌 最大爬取深度：{MAX_CRAWL_DEPTH}")
+    print(f"📌 单语料文件保存条数：{SAVE_CHUNK_SIZE}条")
+    print(f"📌 最大爬取页面数：{MAX_CRAWL_COUNT}")
+    print(f"📌 语料文件命名：1.txt、2.txt、3.txt...（完全适配训练代码）")
+    print("\n🚀 爬取任务启动，按 Ctrl+C 可中断并保存进度\n")
+
+    try:
+        while crawl_queue and len(visited_urls) < MAX_CRAWL_COUNT:
+            # 爬取模式选择：深度优先取队列尾部，广度优先取队列头部
+            if CRAWL_MODE == "depth":
+                current_url, current_depth = crawl_queue.pop()
+            else:
+                current_url, current_depth = crawl_queue.pop(0)
+
+            # 跳过已爬取、超深度的URL
+            if current_url in visited_urls:
+                continue
+            if current_depth > MAX_CRAWL_DEPTH:
+                continue
+
+            # 标记为已访问，更新进度条
+            visited_urls.add(current_url)
+            pbar.update(1)
+
+            # 发送HTTP请求，带重试机制
+            try:
+                # 随机延时，规避反爬
+                time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                # 发送请求
+                response = requests.get(
+                    current_url,
+                    headers=get_headers(),
+                    timeout=15,
+                    allow_redirects=True
+                )
+                # 状态码校验
+                if response.status_code not in [200, 201]:
+                    tqdm.write(f"⚠️  请求失败，状态码：{response.status_code}，URL：{current_url[:80]}...")
+                    continue
+                # 解析HTML
+                response.encoding = "utf-8"
+                soup = BeautifulSoup(response.text, "html.parser")
+            except Exception as e:
+                tqdm.write(f"⚠️  请求异常：{str(e)}，URL：{current_url[:80]}...")
+                continue
+
+            # 1. 提取并清洗正文内容
+            article_content = extract_article_content(soup)
+            if article_content:
+                current_articles.append(article_content)
+                total_article_count += 1
+                # 实时显示缓存进度
+                pbar.set_postfix({
+                    "缓存条数": f"{len(current_articles)}/{SAVE_CHUNK_SIZE}",“缓存条数”: f”{len(current_articles)}/{SAVE_CHUNK_SIZE}”,
+                    "总有效文章": total_article_count“总有效文章”: total_article_count
+                })
+
+            # 2. 提取页面内链，加入爬取队列
+            new_links = extract_links(soup, current_url)
+            for link in new_links:
+                if link not in visited_urls:如果链接不在已访问的URL中：
+                    crawl_queue.append((link, current_depth + 1))
+
+            # 3. 达到5000条，保存为语料文件
+            if len(current_articles) >= SAVE_CHUNK_SIZE:
+                # 取前5000条保存，剩余的留到下一个文件
+                save_articles = current_articles[:SAVE_CHUNK_SIZE]
+                current_articles = current_articles[SAVE_CHUNK_SIZE:]
+                save_corpus(save_articles, chunk_index)保存语料库（保存文章，分块索引）
+                chunk_index += 1块索引 += 1
+                # 保存一次断点状态，避免数据丢失
+                save_crawl_state(visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, current_articles)
+
+            # 4. 每100个页面保存一次断点状态
+            if len(visited_urls) % 100 == 0:如果已访问的URL数量 % 100 == 0：如果已访问的URL数量 % 100 == 0：
+                save_crawl_state(visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, current_articles)
+
+        # 爬取结束，保存剩余不足5000条的内容
+        if current_articles:
+            save_corpus(current_articles, chunk_index)保存语料库(当前文章, 分块索引)
+            chunk_index += 1块索引 += 1
+
+        # 最终状态保存
+        save_crawl_state(visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, [])保存爬取状态(已访问的URL，爬取队列，当前深度，文章总数，分块索引，[])
+        pbar.close()
+
+        # 最终统计信息
+        print("\n" + "="*60)
+        print("🎉 爬取任务全部完成！")
+        print("="*60)
+        print(f"📊 总计爬取页面数：{len(visited_urls)}")
+        print(f"📊 总计有效文章数：{total_article_count}")
+        print(f"📊 生成预训练语料文件数：{chunk_index-1}个")
+        print(f"📁 语料文件保存目录：{SAVE_DIR}")
+        print("✅ 所有语料文件已完全适配训练代码，直接运行训练代码即可开始预训练")
+
+    except KeyboardInterrupt:除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：除 KeyboardInterrupt 以外：
+        # 手动中断，保存全状态
+        pbar.close()
+        print("\n\n🛑 手动中断爬取，已完整保存当前进度")
+        if current_articles:
+            print(f"📦 缓存的{len(current_articles)}条文章已保存到断点，下次运行自动续存")
+        save_crawl_state(visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, current_articles)
+        print("✅ 下次运行本代码，将自动从断点继续爬取，无需从头开始")
+    except Exception as e:
+        # 异常中断，保存全状态
+        pbar.close()
+        print(f"\n❌ 爬取异常：{str(e)}")
+        print("🛑 已自动保存当前进度，下次运行将自动续爬")打印("已自动保存当前进度，下次运行将自动续爬")
+        save_crawl_state(visited_urls, crawl_queue, current_depth, total_article_count, chunk_index, current_articles)
+
