@@ -1,0 +1,3 @@
+python -m pip install paddlepaddle==2.6.1 -i https://mirror.baidu.com/pypi/simple
+python -m pip install sentencepiece tqdm numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+
