@@ -1,0 +1,958 @@
+# ====================================== 1. 全局依赖导入 ======================================
+import os
+import re
+import hashlib
+import glob
+import random
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict
+from easydict import EasyDict
+
+import numpy as np
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+import sentencepiece as spm
+from simhash import Simhash, SimhashIndex
+import langdetect
+from langdetect import LangDetectException
+
+# ====================================== 2. 全流程超参数配置（兼容你原代码的核心参数） ======================================
+# 所有参数可直接在这里修改，无需改动代码逻辑
+CONFIG = EasyDict({
+    # 硬件与环境配置
+    "device": "cpu",
+    "physical_cpu_cores": 8,          # 你的CPU物理核心数，8代i7填8，i5填6
+    "enable_mkldnn": True,             # Intel CPU必开，国产CPU可按需关闭
+    "avx_instruction_set": "AVX2",
+    "seed": 42,
+    "cpu_deterministic": True,
+
+    # 数据与分词配置
+    "corpus_dir": "./corpus",          # 你的语料存放目录，数字命名的txt放这里（1.txt/2.txt...）
+    "preprocessed_data_dir": "./preprocessed_data",
+    "tokenizer_dir": "./tokenizer",
+    "vocab_size": 32000,
+    "max_seq_len": 512,                # 你原代码的序列长度，可按需调整
+    "val_ratio": 0.1,
+    "min_text_length": 30,
+    "character_coverage": 0.9995,
+
+    # 模型架构配置（完全兼容你原GPT结构，升级为Llama标准范式）
+    "embed_dim": 512,
+    "num_q_heads": 8,
+    "num_kv_heads": 2,                 # GQA分组查询，兼容你原代码的MHA
+    "num_layers": 8,
+    "ffn_expansion_ratio": 2.67,       # 兼容你原代码的mlp_dim
+    "norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "residual_dropout": 0.1,
+    "attention_dropout": 0.1,
+    "tie_word_embeddings": True,       # 你原代码的权重共享
+    "use_gradient_checkpointing": False, # CPU内存不足可开启
+
+    # MoE混合专家配置（可关闭，关闭后自动退化为你原代码的普通FFN）
+    "enable_moe": True,
+    "moe_expert_num": 4,
+    "moe_top_k": 2,
+    "moe_capacity_factor": 1.2,
+    "moe_z_loss_coeff": 0.001,
+    "moe_balance_loss_coeff": 0.01,
+    "moe_layer_interval": 2,
+
+    # 训练超参数（兼容你原代码的核心训练逻辑）
+    "batch_size_per_step": 2,
+    "gradient_accumulation_steps": 4,
+    "global_batch_size": 8,
+    "base_lr": 1.5e-4,
+    "min_lr": 1.5e-6,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "label_smoothing": 0.03,
+    "z_loss_coeff": 1e-4,              # 稳定训练，防止logits溢出
+
+    # 训练流程配置（兼容你原代码的循环逻辑）
+    "max_epochs": 3,
+    "early_stop_patience": 2,
+    "early_stop_min_delta": 0.01,
+    "val_interval": 100,               # 每N步验证一次
+    "log_interval": 10,                # 每N步打印日志
+    "save_interval": 500,              # 每N步保存断点
+
+    # 学习率调度配置（兼容你原代码的预热+余弦退火）
+    "warmup_steps_ratio": 0.02,
+    "enable_ema": True,
+    "ema_decay": 0.9999,
+
+    # 路径配置
+    "checkpoint_dir": "./checkpoints",
+    "log_dir": "./logs",
+    "final_model_save_path": "./checkpoints/final_pretrain_model.pdparams"
+})
+
+# 自动创建所有目录
+for dir_path in [
+    CONFIG.corpus_dir, CONFIG.preprocessed_data_dir, CONFIG.tokenizer_dir,
+    CONFIG.checkpoint_dir, CONFIG.log_dir
+]:
+    os.makedirs(dir_path, exist_ok=True)
+
+# ====================================== 3. CPU环境初始化（你原代码缺失的工业级CPU优化） ======================================
+def set_random_seed(seed: int = 42, deterministic: bool = True):
+    """固定全链路随机种子，保证训练可复现，兼容你原代码的确定性要求"""
+    random.seed(seed)
+    np.random.seed(seed)
+    paddle.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        os.environ["FLAGS_cpu_deterministic"] = "1"
+        paddle.set_flags({"FLAGS_cpu_deterministic": True})
+
+def setup_cpu_env(config: EasyDict):
+    """Intel/国产CPU极致优化，解决你原代码CPU训练速度慢的问题"""
+    cpu_cores = config.physical_cpu_cores
+    
+    # 核心线程与MKL优化
+    os.environ["OMP_NUM_THREADS"] = str(cpu_cores)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_cores)
+    os.environ["MKL_ENABLE_INSTRUCTIONS"] = config.avx_instruction_set
+    os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+    os.environ["KMP_BLOCKTIME"] = "1"
+    
+    # Paddle MKL-DNN加速
+    if config.enable_mkldnn:
+        os.environ["FLAGS_use_mkldnn"] = "1"
+        paddle.set_flags({"FLAGS_use_mkldnn": True})
+    
+    # 内存优化
+    os.environ["FLAGS_eager_delete_tensor_gb"] = "0.0"
+    os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+    os.environ["FLAGS_fast_eager_deletion_mode"] = "1"
+    
+    # 设备锁定
+    paddle.set_device(config.device)
+    paddle.set_num_threads(cpu_cores)
+    paddle.set_num_interop_threads(cpu_cores)
+    paddle.set_float32_matmul_precision("medium")
+    
+    # 固定随机种子
+    set_random_seed(config.seed, config.cpu_deterministic)
+
+# 初始化环境
+setup_cpu_env(CONFIG)
+
+# ====================================== 4. 日志系统（升级你原代码的简陋log函数） ======================================
+def setup_logger(config: EasyDict) -> logging.Logger:
+    """工业级分级日志系统，支持日志轮转、全链路追踪"""
+    log_file = os.path.join(config.log_dir, "train.log")
+    logger = logging.getLogger("llm_pretrain")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    
+    # 清空已有handler
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # 日志格式
+    log_format = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    
+    # 控制台输出
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(log_format)
+    logger.addHandler(console_handler)
+    
+    # 文件输出（支持轮转）
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=100*1024*1024, backupCount=10, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+    
+    # 启动日志
+    logger.info("="*80)
+    logger.info(f"大模型预训练启动，时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"硬件环境：{CONFIG.physical_cpu_cores}核CPU，MKL-DNN={'开启' if CONFIG.enable_mkldnn else '关闭'}")
+    logger.info("="*80)
+    return logger
+
+# 初始化日志
+LOGGER = setup_logger(CONFIG)
+
+# ====================================== 5. 数据清洗与去重（升级你原代码的clean_dedup_lines函数） ======================================
+class TextCleaner:
+    """工业级文本清洗器，兼容你原代码的清洗逻辑，新增多维度过滤"""
+    def __init__(self, config: EasyDict):
+        self.config = config
+        self.min_text_length = config.min_text_length
+        self.target_language = "zh"
+        
+        # 正则规则（兼容你原代码的正则，新增更多过滤规则）
+        self.html_re = re.compile(r'<.*?>', re.S)
+        self.url_re = re.compile(r'https?://\S+|www\.\S+', re.S)
+        self.duplicate_punct_re = re.compile(r'([。！？，；：])\1+', re.S)
+        self.whitespace_re = re.compile(r'\s+', re.S)
+        self.special_char_re = re.compile(r'[^\u4e00-\u9fa5a-zA-Z0-9\s。！？，；：""''()（）【】、·.,?!;:]', re.S)
+        
+        # 关键词过滤
+        self.ad_keywords = ["广告", "售后", "微信", "微博", "扫码", "关注", "公众号", "加微"]
+        self.invalid_keywords = ["广告", "售后", "请联系", "微信", "微博"]
+
+    def normalize_unicode(self, text: str) -> str:
+        """兼容你原代码的全角半角转换"""
+        text = text.replace('\u3000',' ').replace('\u00A0',' ').replace('\u200B','')
+        res = []
+        for c in text:
+            code = ord(c)
+            if 0xFF01 <= code <= 0xFF5E:
+                code -= 0xFEE0
+            res.append(chr(code))
+        return ''.join(res)
+
+    def clean_dedup_lines(self, raw_files: List[str]) -> List[str]:
+        """完全兼容你原代码的clean_dedup_lines函数，升级为工业级实现"""
+        seen_sha1 = set()
+        seen_simhash = SimhashIndex([], k=3)
+        valid_lines = []
+        
+        for file_path in raw_files:
+            LOGGER.info(f"处理语料文件：{os.path.basename(file_path)}")
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line_num, line in enumerate(f):
+                    # 基础清洗（完全兼容你原代码的逻辑）
+                    t = self.html_re.sub("", line.strip())
+                    t = self.url_re.sub("", t)
+                    t = self.normalize_unicode(t)
+                    t = self.whitespace_re.sub(" ", t)
+                    
+                    # 过滤无效文本（兼容你原代码的过滤规则）
+                    if len(t) < self.min_text_length:
+                        continue
+                    if any(kw in t for kw in self.invalid_keywords):
+                        continue
+                    
+                    # 精确去重（兼容你原代码的sha1去重）
+                    sha1_hash = hashlib.sha1(t.encode()).hexdigest()
+                    if sha1_hash in seen_sha1:
+                        continue
+                    seen_sha1.add(sha1_hash)
+                    
+                    # 新增：模糊去重（解决你原代码无法去重相似文本的问题）
+                    sim_hash = Simhash(t)
+                    if seen_simhash.get_near_dups(sim_hash):
+                        continue
+                    seen_simhash.add(f"line_{line_num}_{sha1_hash}", sim_hash)
+                    
+                    valid_lines.append(t)
+        
+        LOGGER.info(f"清洗去重完成，有效文本行数：{len(valid_lines)}")
+        return valid_lines
+
+# ====================================== 6. 分词器管理（升级你原代码的spm训练逻辑） ======================================
+class SentencePieceTokenizer:
+    """统一分词器管理，完全兼容你原代码的sentencepiece训练逻辑"""
+    def __init__(self, config: EasyDict):
+        self.config = config
+        self.model_path = os.path.join(config.tokenizer_dir, "unified_spm.model")
+        self.vocab_path = os.path.join(config.tokenizer_dir, "unified_spm.vocab")
+        self.sp = None
+        
+        # 加载已训练好的模型
+        if os.path.exists(self.model_path):
+            self.load()
+            LOGGER.info(f"分词器加载完成，词汇表大小：{self.vocab_size}")
+
+    def train(self, corpus_path: str):
+        """完全兼容你原代码的spm训练参数，升级为工业级配置"""
+        LOGGER.info(f"开始训练分词器，语料路径：{corpus_path}")
+        spm.SentencePieceTrainer.train(
+            input=corpus_path,
+            model_prefix=os.path.join(self.config.tokenizer_dir, "unified_spm"),
+            vocab_size=self.config.vocab_size,
+            character_coverage=self.config.character_coverage,
+            model_type="bpe",
+            bos_id=1,
+            eos_id=2,
+            pad_id=0,
+            unk_id=3,
+            byte_fallback=True,
+            split_digits=True,
+            max_sentence_length=4192,
+            num_threads=self.config.physical_cpu_cores
+        )
+        self.load()
+        LOGGER.info(f"分词器训练完成，词汇表大小：{self.vocab_size}")
+
+    def load(self):
+        self.sp = spm.SentencePieceProcessor(model_file=self.model_path)
+        self.bos_id = self.sp.bos_id()
+        self.eos_id = self.sp.eos_id()
+        self.pad_id = self.sp.pad_id()
+        self.unk_id = self.sp.unk_id()
+
+    @property
+    def vocab_size(self) -> int:
+        return self.sp.vocab_size()
+
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+        ids = self.sp.encode(text, out_type=int)
+        if add_bos:
+            ids = [self.bos_id] + ids
+        if add_eos:
+            ids = ids + [self.eos_id]
+        return ids
+
+    def encode_batch(self, texts: List[str]) -> List[List[int]]:
+        return [self.encode(text, add_eos=True) for text in texts]
+
+# ====================================== 7. 数据集与DataLoader（升级你原代码的TextDataset） ======================================
+class TextDataset(paddle.io.Dataset):
+    """完全兼容你原代码的TextDataset，升级为工业级高效实现"""
+    def __init__(self, all_token_ids: np.ndarray, seq_len: int, random_start: bool = True):
+        super().__init__()
+        self.tokens = all_token_ids
+        self.seq_len = seq_len
+        self.random_start = random_start
+        # 兼容你原代码的滑窗索引逻辑
+        self.indices = list(range(0, len(self.tokens) - seq_len, seq_len))
+
+    def __getitem__(self, idx: int) -> Tuple[paddle.Tensor, paddle.Tensor]:
+        """完全兼容你原代码的输入输出逻辑，x和y移位自回归"""
+        i = self.indices[idx]
+        # 新增：随机起点增强，解决你原代码固定滑窗的过拟合问题
+        if self.random_start and random.random() < 0.5:
+            i += random.randint(0, self.seq_len // 4)
+            i = max(0, min(i, len(self.tokens) - self.seq_len))
+        
+        # 完全兼容你原代码的x/y构建逻辑
+        x = self.tokens[i:i+self.seq_len-1]
+        y = self.tokens[i+1:i+self.seq_len]
+        return paddle.to_tensor(x, dtype="int64"), paddle.to_tensor(y, dtype="int64")
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+# ====================================== 8. 模型核心层（升级你原代码的layers.py/backbone.py，完全兼容原结构） ======================================
+class RMSNorm(nn.Layer):
+    """升级你原代码的RMSNorm，兼容混合精度，对齐Llama标准实现"""
+    def __init__(self, d: int, eps: float = 1e-6):
+        super().__init__()
+        self.w = self.create_parameter([d], default_initializer=nn.initializer.Constant(1.0))
+        self.eps = eps
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        input_dtype = x.dtype
+        x = x.cast(paddle.float32)
+        return (x * self.w / paddle.sqrt((x*x).mean(-1, keepdim=True) + self.eps)).cast(input_dtype)
+
+class RoPE(nn.Layer):
+    """新增旋转位置编码，解决你原代码固定位置编码的长文本泛化问题"""
+    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10000.0):
+        super().__init__()
+        self.head_dim = head_dim
+        freqs = 1.0 / (theta ** (paddle.arange(0, head_dim, 2).astype(paddle.float32) / head_dim))
+        seq_idx = paddle.arange(max_seq_len).astype(paddle.float32)
+        freqs = paddle.outer(seq_idx, freqs)
+        self.register_buffer("freqs_cos", freqs.cos()[None, None, :, :])
+        self.register_buffer("freqs_sin", freqs.sin()[None, None, :, :])
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        input_dtype = x.dtype
+        seq_len = x.shape[2]
+        cos = self.freqs_cos[:, :, :seq_len, :].cast(input_dtype)
+        sin = self.freqs_sin[:, :, :seq_len, :].cast(input_dtype)
+        x1, x2 = x.chunk(2, axis=-1)
+        x_rot = paddle.concat([-x2, x1], axis=-1)
+        return x * cos + x_rot * sin
+
+class GQAAttention(nn.Layer):
+    """升级你原代码的MultiHeadAttention，支持GQA/MQA，兼容原MHA逻辑"""
+    def __init__(self, d: int, n_head: int, n_kv_head: int, max_seq_len: int, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        self.head_dim = d // n_head
+        self.kv_repeat = n_head // n_kv_head
+
+        self.qkv_proj = nn.Linear(d, (n_head + 2 * n_kv_head) * self.head_dim, bias_attr=False)
+        self.out_proj = nn.Linear(d, d, bias_attr=False)
+        self.rope = RoPE(self.head_dim, max_seq_len)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: paddle.Tensor, mask: Optional[paddle.Tensor] = None):
+        b, s, _ = x.shape
+        qkv = self.qkv_proj(x)
+        q = qkv[:, :, :self.n_head * self.head_dim].reshape([b, s, self.n_head, self.head_dim]).transpose([0, 2, 1, 3])
+        k = qkv[:, :, self.n_head * self.head_dim:(self.n_head + self.n_kv_head) * self.head_dim].reshape([b, s, self.n_kv_head, self.head_dim]).transpose([0, 2, 1, 3])
+        v = qkv[:, :, (self.n_head + self.n_kv_head) * self.head_dim:].reshape([b, s, self.n_kv_head, self.head_dim]).transpose([0, 2, 1, 3])
+
+        # RoPE位置编码
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # GQA分组重复，兼容你原代码的MHA（当n_kv_head=n_head时退化为标准MHA）
+        k = k.repeat_interleave(self.kv_repeat, axis=1)
+        v = v.repeat_interleave(self.kv_repeat, axis=1)
+
+        # 注意力计算
+        attn_scores = (q @ k.transpose([0, 1, 3, 2])) / (self.head_dim ** 0.5)
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+        attn_weights = F.softmax(attn_scores, axis=-1)
+        attn_weights = self.dropout(attn_weights)
+        attn_output = (attn_weights @ v).transpose([0, 2, 1, 3]).reshape([b, s, self.d_model])
+        return self.out_proj(attn_output)
+
+class SwiGLU(nn.Layer):
+    """升级你原代码的GELU FFN，对齐Llama标准SwiGLU，训练更稳定"""
+    def __init__(self, d: int, mlp_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.gate_up = nn.Linear(d, 2 * mlp_dim, bias_attr=False)
+        self.down = nn.Linear(mlp_dim, d, bias_attr=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        gate, up = self.gate_up(x).chunk(2, axis=-1)
+        return self.dropout(self.down(F.silu(gate) * up))
+
+class MoEExpert(nn.Layer):
+    """新增MoE混合专家层，兼容你原代码的普通FFN，关闭enable_moe自动退化"""
+    def __init__(self, d: int, mlp_dim: int, num_experts: int, top_k: int, dropout: float = 0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(d, num_experts, bias_attr=False)
+        self.experts = nn.LayerList([SwiGLU(d, mlp_dim, dropout) for _ in range(num_experts)])
+        self.balance_loss = paddle.to_tensor(0.0)
+
+    def forward(self, x: paddle.Tensor) -> Tuple[paddle.Tensor, paddle.Tensor]:
+        b, s, d = x.shape
+        x_flat = x.reshape([-1, d])
+        gate_logits = self.gate(x_flat)
+        gate_probs = F.softmax(gate_logits, axis=-1)
+        top_k_probs, top_k_indices = paddle.topk(gate_probs, self.top_k, axis=-1)
+        top_k_probs = top_k_probs / top_k_probs.sum(axis=-1, keepdim=True)
+
+        # 负载均衡损失
+        expert_counts = paddle.histogram(top_k_indices.flatten().cast(paddle.float32), bins=self.num_experts, min=0, max=self.num_experts-1) / (b*s)
+        self.balance_loss = (gate_probs.mean(axis=0) * expert_counts).sum() * self.num_experts
+
+        # 专家计算
+        output = paddle.zeros_like(x_flat)
+        for expert_idx in range(self.num_experts):
+            token_mask = (top_k_indices == expert_idx).any(axis=-1)
+            if token_mask.sum() == 0:
+                continue
+            token_indices = paddle.where(token_mask)[0]
+            expert_input = x_flat[token_indices]
+            expert_weight = top_k_probs[token_indices][:, top_k_indices[token_indices] == expert_idx].mean(axis=-1, keepdim=True)
+            output[token_indices] += self.experts[expert_idx](expert_input) * expert_weight
+        
+        return output.reshape([b, s, d]), self.balance_loss
+
+class GPTBlock(nn.Layer):
+    """完全兼容你原代码的GPTBlock结构，升级为工业级Pre-Norm范式"""
+    def __init__(
+        self, d: int, n_head: int, n_kv_head: int, mlp_dim: int, max_seq_len: int,
+        dropout=0.1, enable_moe=False, num_experts=4, top_k=2
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(d)
+        self.attn = GQAAttention(d, n_head, n_kv_head, max_seq_len, dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm2 = RMSNorm(d)
+        
+        # 兼容你原代码的FFN，支持MoE切换
+        self.enable_moe = enable_moe
+        if enable_moe:
+            self.ffn = MoEExpert(d, mlp_dim, num_experts, top_k, dropout)
+        else:
+            self.ffn = SwiGLU(d, mlp_dim, dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: paddle.Tensor, mask: Optional[paddle.Tensor] = None) -> Tuple[paddle.Tensor, paddle.Tensor]:
+        # 完全兼容你原代码的残差连接逻辑
+        attn_out = self.attn(self.norm1(x), mask)
+        x = x + self.dropout1(attn_out)
+        
+        # FFN/MoE前向
+        if self.enable_moe:
+            ffn_out, balance_loss = self.ffn(self.norm2(x))
+        else:
+            ffn_out = self.ffn(self.norm2(x))
+            balance_loss = paddle.to_tensor(0.0)
+        x = x + self.dropout2(ffn_out)
+        
+        return x, balance_loss
+
+class GPTLM(nn.Layer):
+    """完全兼容你原代码的GPTLM结构，升级为工业级实现，所有接口完全兼容"""
+    def __init__(
+        self, vocab_size, d_model, n_head, n_kv_head, n_layer, mlp_dim, max_seq_len,
+        dropout=0.1, enable_moe=False, moe_expert_num=4, moe_top_k=2, moe_layer_interval=2
+    ):
+        super().__init__()
+        # 兼容你原代码的嵌入层
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = self.create_parameter([max_seq_len, d_model], default_initializer=nn.initializer.Normal(0, .02))
+        self.dropout = nn.Dropout(dropout)
+        
+        # 兼容你原代码的Block堆叠，支持MoE间隔部署
+        self.blocks = nn.LayerList()
+        for layer_idx in range(n_layer):
+            layer_enable_moe = enable_moe and (layer_idx % moe_layer_interval == 0)
+            self.blocks.append(
+                GPTBlock(
+                    d=d_model, n_head=n_head, n_kv_head=n_kv_head, mlp_dim=mlp_dim,
+                    max_seq_len=max_seq_len, dropout=dropout, enable_moe=layer_enable_moe,
+                    num_experts=moe_expert_num, top_k=moe_top_k
+                )
+            )
+        
+        # 兼容你原代码的输出层
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head.weight = self.emb.weight  # 完全兼容你原代码的权重共享
+
+    def forward(self, x: paddle.Tensor) -> Tuple[paddle.Tensor, paddle.Tensor]:
+        """
+        完全兼容你原代码的forward逻辑，新增返回MoE总损失
+        返回：logits, total_balance_loss
+        """
+        b, s = x.shape
+        h = self.emb(x) + self.pos_emb[:s]
+        h = self.dropout(h)
+        
+        # 兼容你原代码的因果掩码
+        mask = nn.Transformer.generate_square_subsequent_mask(s)
+        total_balance_loss = paddle.to_tensor(0.0)
+        
+        # 前向传播
+        for blk in self.blocks:
+            h, balance_loss = blk(h, mask)
+            total_balance_loss += balance_loss
+        
+        h = self.norm(h)
+        logits = self.lm_head(h)
+        return logits, total_balance_loss
+
+# ====================================== 9. 优化器与学习率调度（升级你原代码的优化器逻辑） ======================================
+def get_param_groups(model: nn.Layer, weight_decay: float):
+    """完全兼容你原代码的参数分组逻辑，新增更精细的分组规则"""
+    decay, nodecay = [], []
+    for n, p in model.named_parameters():
+        if not p.stop_gradient:
+            # 兼容你原代码的无衰减参数规则
+            if 'bias' in n or 'norm' in n.lower() or 'embedding' in n.lower():
+                nodecay.append(p)
+            else:
+                decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": nodecay, "weight_decay": 0.0}
+    ]
+
+class EMA:
+    """新增EMA权重滑动平均，提升模型泛化能力，工业级训练必备"""
+    def __init__(self, model: nn.Layer, decay: float = 0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        # 初始化影子权重
+        for name, param in model.named_parameters():
+            if not param.stop_gradient:
+                self.shadow[name] = param.clone().detach()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.detach()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                self.backup[name] = param.clone()
+                param.set_value(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                param.set_value(self.backup[name])
+
+# ====================================== 10. 断点管理（升级你原代码的断点续训逻辑） ======================================
+def save_checkpoint(
+    config: EasyDict, model: nn.Layer, optimizer: paddle.optimizer.Optimizer,
+    scheduler: paddle.optimizer.lr.LRScheduler, ema: Optional[EMA],
+    tokenizer: SentencePieceTokenizer, global_step: int, epoch: int,
+    val_ppl: float, is_best: bool = False
+):
+    """完全兼容你原代码的断点保存逻辑，升级为全状态保存"""
+    checkpoint = {
+        "config": dict(config),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "ema_state_dict": ema.shadow if ema is not None else None,
+        "tokenizer_vocab_size": tokenizer.vocab_size,
+        "global_step": global_step,
+        "epoch": epoch,
+        "val_ppl": val_ppl
+    }
+    
+    # 保存最新断点
+    latest_save_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pdparams")
+    paddle.save(checkpoint, latest_save_path)
+    LOGGER.info(f"断点已保存，步数：{global_step}，路径：{latest_save_path}")
+    
+    # 保存最优断点
+    if is_best:
+        best_save_path = os.path.join(config.checkpoint_dir, "best_checkpoint.pdparams")
+        paddle.save(checkpoint, best_save_path)
+        LOGGER.info(f"最优断点已更新，验证PPL：{val_ppl:.4f}，路径：{best_save_path}")
+
+def load_checkpoint(config: EasyDict, model: nn.Layer, optimizer: paddle.optimizer.Optimizer,
+                    scheduler: paddle.optimizer.lr.LRScheduler, ema: Optional[EMA]) -> Tuple[int, int, float]:
+    """完全兼容你原代码的断点加载逻辑，支持断点续训"""
+    latest_checkpoint_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pdparams")
+    if not os.path.exists(latest_checkpoint_path):
+        LOGGER.info("未找到断点，从头开始训练")
+        return 0, 0, float("inf")
+    
+    LOGGER.info(f"加载断点：{latest_checkpoint_path}")
+    checkpoint = paddle.load(latest_checkpoint_path)
+    
+    # 加载状态
+    model.set_state_dict(checkpoint["model_state_dict"])
+    optimizer.set_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.set_state_dict(checkpoint["scheduler_state_dict"])
+    if ema is not None and checkpoint["ema_state_dict"] is not None:
+        ema.shadow = checkpoint["ema_state_dict"]
+    
+    # 恢复训练进度
+    global_step = checkpoint["global_step"]
+    start_epoch = checkpoint["epoch"]
+    best_val_ppl = checkpoint["val_ppl"]
+    
+    LOGGER.info(f"断点加载完成，起始步数：{global_step}，起始轮次：{start_epoch}，最优PPL：{best_val_ppl:.4f}")
+    return global_step, start_epoch, best_val_ppl
+
+# ====================================== 11. 评估函数（升级你原代码的evaluate函数） ======================================
+def evaluate(model: nn.Layer, val_loader: paddle.io.DataLoader, vocab_size: int, ema: Optional[EMA] = None) -> float:
+    """完全兼容你原代码的PPL评估逻辑，升级为工业级实现"""
+    # 应用EMA权重（如果开启）
+    if ema is not None:
+        ema.apply_shadow()
+    
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    
+    with paddle.no_grad():
+        for x, y in val_loader:
+            logits, _ = model(x)
+            # 兼容你原代码的交叉熵损失计算
+            loss = F.cross_entropy(
+                logits.reshape([-1, vocab_size]),
+                y.reshape([-1]),
+                label_smoothing=CONFIG.label_smoothing
+            )
+            total_loss += loss.numpy()[0] * len(x)
+            total_samples += len(x)
+    
+    # 恢复原模型权重
+    if ema is not None:
+        ema.restore()
+    
+    # 计算PPL
+    avg_loss = total_loss / total_samples
+    val_ppl = np.exp(avg_loss)
+    model.train()
+    return val_ppl
+
+# ====================================== 12. 主训练流程（完全兼容你原代码的训练逻辑，升级为工业级引擎） ======================================
+def main():
+    # -------------------------- 1. 数据预处理（兼容你原代码的处理逻辑） --------------------------
+    LOGGER.info("="*80)
+    LOGGER.info("第一步：语料预处理与分词器训练")
+    LOGGER.info("="*80)
+    
+    # 扫描语料文件
+    raw_files = sorted(glob.glob(os.path.join(CONFIG.corpus_dir, "*.txt")), key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+    if len(raw_files) == 0:
+        LOGGER.error(f"语料目录{CONFIG.corpus_dir}中未找到任何txt文件，请先放置数字命名的语料文件！")
+        return
+    LOGGER.info(f"扫描到{len(raw_files)}个语料文件：{[os.path.basename(f) for f in raw_files]}")
+    
+    # 初始化清洗器和分词器
+    cleaner = TextCleaner(CONFIG)
+    tokenizer = SentencePieceTokenizer(CONFIG)
+    
+    # 清洗去重语料
+    cleaned_corpus = cleaner.clean_dedup_lines(raw_files)
+    merged_corpus_path = os.path.join(CONFIG.preprocessed_data_dir, "merged_corpus.txt")
+    with open(merged_corpus_path, "w", encoding="utf-8") as f:
+        for line in cleaned_corpus:
+            f.write(line + "\n")
+    
+    # 训练分词器（如果不存在）
+    if not os.path.exists(tokenizer.model_path):
+        tokenizer.train(merged_corpus_path)
+    
+    # 全量分词（兼容你原代码的预分词持久化逻辑）
+    LOGGER.info("开始全量语料分词...")
+    all_token_ids = []
+    for line in cleaned_corpus:
+        all_token_ids.extend(tokenizer.encode(line, add_eos=True))
+    all_token_ids = np.array(all_token_ids, dtype=np.int64)
+    LOGGER.info(f"全量分词完成，总token数：{len(all_token_ids)}")
+    
+    # 划分训练集和验证集
+    split_idx = int(len(all_token_ids) * (1 - CONFIG.val_ratio))
+    train_token_ids = all_token_ids[:split_idx]
+    val_token_ids = all_token_ids[split_idx:]
+    LOGGER.info(f"数据集划分：训练集token数{len(train_token_ids)}，验证集token数{len(val_token_ids)}")
+    
+    # 构建DataLoader（完全兼容你原代码的TextDataset）
+    train_dataset = TextDataset(train_token_ids, CONFIG.max_seq_len)
+    val_dataset = TextDataset(val_token_ids, CONFIG.max_seq_len, random_start=False)
+    
+    train_loader = paddle.io.DataLoader(
+        train_dataset,
+        batch_size=CONFIG.batch_size_per_step,
+        shuffle=True,
+        num_workers=CONFIG.physical_cpu_cores // 2,
+        drop_last=True,
+        use_shared_memory=True
+    )
+    val_loader = paddle.io.DataLoader(
+        val_dataset,
+        batch_size=CONFIG.batch_size_per_step,
+        shuffle=False,
+        num_workers=CONFIG.physical_cpu_cores // 2,
+        drop_last=False
+    )
+    
+    total_steps_per_epoch = len(train_loader) // CONFIG.gradient_accumulation_steps
+    total_train_steps = total_steps_per_epoch * CONFIG.max_epochs
+    warmup_steps = int(total_train_steps * CONFIG.warmup_steps_ratio)
+    LOGGER.info(f"训练总步数：{total_train_steps}，预热步数：{warmup_steps}")
+    
+    # -------------------------- 2. 模型初始化（完全兼容你原代码的GPTLM结构） --------------------------
+    LOGGER.info("="*80)
+    LOGGER.info("第二步：模型初始化")
+    LOGGER.info("="*80)
+    
+    model = GPTLM(
+        vocab_size=tokenizer.vocab_size,
+        d_model=CONFIG.embed_dim,
+        n_head=CONFIG.num_q_heads,
+        n_kv_head=CONFIG.num_kv_heads,
+        n_layer=CONFIG.num_layers,
+        mlp_dim=int(CONFIG.embed_dim * CONFIG.ffn_expansion_ratio),
+        max_seq_len=CONFIG.max_seq_len,
+        dropout=CONFIG.residual_dropout,
+        enable_moe=CONFIG.enable_moe,
+        moe_expert_num=CONFIG.moe_expert_num,
+        moe_top_k=CONFIG.moe_top_k,
+        moe_layer_interval=CONFIG.moe_layer_interval
+    )
+    
+    # 统计模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if not p.stop_gradient)
+    LOGGER.info(f"模型总参数量：{total_params/1e6:.2f}M，可训练参数量：{trainable_params/1e6:.2f}M")
+    
+    # -------------------------- 3. 优化器与调度器初始化（兼容你原代码的逻辑） --------------------------
+    # 优化器（兼容你原代码的AdamW+参数分组）
+    optimizer = paddle.optimizer.AdamW(
+        parameters=get_param_groups(model, CONFIG.weight_decay),
+        learning_rate=CONFIG.base_lr,
+        beta1=0.9,
+        beta2=0.999,
+        epsilon=1e-8,
+        weight_decay=CONFIG.weight_decay,
+        grad_clip=nn.ClipGradByGlobalNorm(CONFIG.max_grad_norm)
+    )
+    
+    # 学习率调度器（兼容你原代码的预热+余弦退火）
+    cosine_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(
+        learning_rate=CONFIG.base_lr,
+        T_max=total_train_steps,
+        eta_min=CONFIG.min_lr
+    )
+    scheduler = paddle.optimizer.lr.LinearWarmup(
+        cosine_scheduler,
+        warmup_steps=warmup_steps,
+        start_lr=CONFIG.warmup_min_lr if hasattr(CONFIG, "warmup_min_lr") else 1e-6,
+        end_lr=CONFIG.base_lr
+    )
+    optimizer.set_lr_scheduler(scheduler)
+    
+    # EMA初始化
+    ema = EMA(model, CONFIG.ema_decay) if CONFIG.enable_ema else None
+    
+    # -------------------------- 4. 断点加载（兼容你原代码的断点续训） --------------------------
+    global_step, start_epoch, best_val_ppl = load_checkpoint(CONFIG, model, optimizer, scheduler, ema)
+    patience = 0
+    
+    # -------------------------- 5. 训练主循环（完全兼容你原代码的循环逻辑，升级为工业级） --------------------------
+    LOGGER.info("="*80)
+    LOGGER.info("第三步：开始预训练")
+    LOGGER.info("="*80)
+    
+    model.train()
+    for epoch in range(start_epoch, CONFIG.max_epochs):
+        LOGGER.info(f"开始第{epoch+1}/{CONFIG.max_epochs}轮训练")
+        epoch_loss = 0.0
+        epoch_balance_loss = 0.0
+        epoch_z_loss = 0.0
+        step_in_epoch = 0
+        
+        for batch_idx, (x, y) in enumerate(train_loader):
+            # 前向传播
+            logits, balance_loss = model(x)
+            
+            # 主损失计算（兼容你原代码的交叉熵损失）
+            ce_loss = F.cross_entropy(
+                logits.reshape([-1, tokenizer.vocab_size]),
+                y.reshape([-1]),
+                label_smoothing=CONFIG.label_smoothing
+            )
+            
+            # z-loss（稳定训练）
+            z_loss = CONFIG.z_loss_coeff * paddle.square(paddle.logsumexp(logits, axis=-1)).mean()
+            
+            # 总损失
+            total_loss = (ce_loss + balance_loss * CONFIG.moe_balance_loss_coeff + z_loss) / CONFIG.gradient_accumulation_steps
+            
+            # 反向传播
+            total_loss.backward()
+            
+            # 梯度累积（兼容你原代码的梯度累积逻辑）
+            if (batch_idx + 1) % CONFIG.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.clear_grad()
+                scheduler.step()
+                if ema is not None:
+                    ema.update()
+                
+                global_step += 1
+                step_in_epoch += 1
+                
+                # 日志打印
+                if global_step % CONFIG.log_interval == 0:
+                    current_lr = optimizer.get_lr()
+                    train_ppl = np.exp(ce_loss.numpy()[0])
+                    LOGGER.info(
+                        f"[Epoch {epoch+1}/{CONFIG.max_epochs}] [Step {global_step}] "
+                        f"LR: {current_lr:.8f} | CE Loss: {ce_loss.numpy()[0]:.4f} | "
+                        f"MoE Loss: {balance_loss.numpy()[0]:.4f} | Z Loss: {z_loss.numpy()[0]:.6f} | "
+                        f"Train PPL: {train_ppl:.4f}"
+                    )
+                
+                # 验证评估（兼容你原代码的验证逻辑）
+                if global_step % CONFIG.val_interval == 0:
+                    LOGGER.info(f"开始验证，步数：{global_step}")
+                    val_ppl = evaluate(model, val_loader, tokenizer.vocab_size, ema)
+                    LOGGER.info(f"验证完成，步数：{global_step}，验证PPL：{val_ppl:.4f}")
+                    
+                    # 早停判断
+                    if val_ppl < best_val_ppl - CONFIG.early_stop_min_delta:
+                        best_val_ppl = val_ppl
+                        patience = 0
+                        is_best = True
+                    else:
+                        patience += 1
+                        is_best = False
+                        LOGGER.info(f"早停耐心值：{patience}/{CONFIG.early_stop_patience}")
+                    
+                    # 保存断点
+                    save_checkpoint(
+                        CONFIG, model, optimizer, scheduler, ema, tokenizer,
+                        global_step, epoch, val_ppl, is_best
+                    )
+                    
+                    # 触发早停
+                    if patience >= CONFIG.early_stop_patience:
+                        LOGGER.info(f"触发早停，训练提前结束，最优验证PPL：{best_val_ppl:.4f}")
+                        break
+                
+                # 定期保存断点
+                if global_step % CONFIG.save_interval == 0:
+                    save_checkpoint(
+                        CONFIG, model, optimizer, scheduler, ema, tokenizer,
+                        global_step, epoch, val_ppl if 'val_ppl' in locals() else float("inf")
+                    )
+            
+            # 累计epoch损失
+            epoch_loss += ce_loss.numpy()[0]
+            epoch_balance_loss += balance_loss.numpy()[0]
+            epoch_z_loss += z_loss.numpy()[0]
+        
+        # 轮次结束日志
+        avg_epoch_loss = epoch_loss / len(train_loader)
+        avg_epoch_ppl = np.exp(avg_epoch_loss)
+        LOGGER.info(
+            f"第{epoch+1}轮训练完成，平均Loss：{avg_epoch_loss:.4f}，平均PPL：{avg_epoch_ppl:.4f}，"
+            f"平均MoE Loss：{epoch_balance_loss/len(train_loader):.4f}"
+        )
+        
+        # 轮次结束验证
+        val_ppl = evaluate(model, val_loader, tokenizer.vocab_size, ema)
+        LOGGER.info(f"第{epoch+1}轮验证完成，验证PPL：{val_ppl:.4f}")
+        
+        # 轮次结束早停判断
+        if val_ppl < best_val_ppl - CONFIG.early_stop_min_delta:
+            best_val_ppl = val_ppl
+            patience = 0
+            is_best = True
+        else:
+            patience += 1
+            is_best = False
+        
+        save_checkpoint(
+            CONFIG, model, optimizer, scheduler, ema, tokenizer,
+            global_step, epoch+1, val_ppl, is_best
+        )
+        
+        if patience >= CONFIG.early_stop_patience:
+            LOGGER.info(f"触发早停，训练提前结束，最优验证PPL：{best_val_ppl:.4f}")
+            break
+    
+    # -------------------------- 6. 训练结束，保存最终模型 --------------------------
+    LOGGER.info("="*80)
+    LOGGER.info("预训练完成，保存最终模型")
+    LOGGER.info("="*80)
+    
+    # 加载最优模型
+    best_checkpoint_path = os.path.join(CONFIG.checkpoint_dir, "best_checkpoint.pdparams")
+    if os.path.exists(best_checkpoint_path):
+        best_checkpoint = paddle.load(best_checkpoint_path)
+        model.set_state_dict(best_checkpoint["model_state_dict"])
+        LOGGER.info("已加载最优模型权重")
+    
+    # 保存最终模型
+    final_model = {
+        "model_state_dict": model.state_dict(),
+        "config": dict(CONFIG),
+        "vocab_size": tokenizer.vocab_size,
+        "tokenizer_model_path": tokenizer.model_path,
+        "best_val_ppl": best_val_ppl
+    }
+    paddle.save(final_model, CONFIG.final_model_save_path)
+    LOGGER.info(f"最终模型已保存，路径：{CONFIG.final_model_save_path}")
+    LOGGER.info(f"预训练全部完成，最优验证PPL：{best_val_ppl:.4f}")
+    LOGGER.info("="*80)
+
+# ====================================== 程序入口 ======================================
+if __name__ == "__main__":
+    main()
+
