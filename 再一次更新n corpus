@@ -1,0 +1,1329 @@
+# ====================================== 全局依赖导入 ======================================
+import os
+import re
+import hashlib
+import random
+import json
+import logging
+import shutil
+import traceback
+import math
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict, Generator, Union
+from easydict import EasyDict
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+import warnings
+warnings.filterwarnings("ignore")
+
+# wandb训练跟踪模块，无安装也可正常运行
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    # 空wandb对象，防止代码报错
+    class DummyWandb:
+        def init(self, *args, **kwargs): pass
+        def log(self, *args, **kwargs): pass
+        def finish(self, *args, **kwargs): pass
+        def Artifact(self, *args, **kwargs): return type('DummyArtifact', (), {'add_file': lambda *args: None})()
+        def run(self): return type('DummyRun', (), {'id': 'dummy_run'})()
+    wandb = DummyWandb()
+
+# 核心计算框架（纯CPU专属适配）
+import numpy as np
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+from paddle.io import IterableDataset, DataLoader
+from paddle.fluid.framework import in_dygraph_mode
+from paddle.distributed.fleet.utils import recompute
+
+# 文本处理工具
+import sentencepiece as spm
+from simhash import Simhash, SimhashIndex
+import langdetect
+from langdetect import LangDetectException
+
+# 多格式数据支持
+import pandas as pd
+import pyarrow.parquet as pq
+
+# ====================================== 纯CPU环境强制锁定 ======================================
+# 彻底屏蔽GPU设备，强制使用CPU训练
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+paddle.set_device("cpu")
+CPU_CORES = max(1, cpu_count())
+IS_MAIN_PROCESS = True
+
+# ====================================== 超参数核心配置 ======================================
+CONFIG = EasyDict({
+    # CPU环境优化参数
+    "physical_cpu_cores": CPU_CORES,
+    "enable_mkldnn": True,
+    "seed": 3407,
+    "deterministic": True,
+    "enable_gradient_checkpointing": False,
+    "enable_mmap_token": True,
+    "enable_nan_inf_detection": True,
+    "wandb_offline": True,
+
+    # wandb训练跟踪配置
+    "enable_wandb": True,
+    "wandb_project": "gpt_cpu_pretrain",
+    "wandb_entity": None,
+    "wandb_run_name": f"gpt_pretrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    "wandb_log_interval": 10,
+    "wandb_save_artifact": True,
+
+    # 数据与分词配置
+    "corpus_dir": "./corpus",
+    "preprocessed_data_dir": "./preprocessed_data",
+    "tokenizer_dir": "./tokenizer",
+    "vocab_size": 32000,
+    "max_seq_len": 512,
+    "train_ratio": 0.90,
+    "val_ratio": 0.05,
+    "test_ratio": 0.05,
+    "min_text_length": 50,
+    "max_text_length": 100000,
+    "character_coverage": 0.9999,
+    "doc_boundary_aware": True,
+
+    # 模型核心架构参数
+    "embed_dim": 512,
+    "num_q_heads": 8,
+    "num_kv_heads": 2,
+    "num_layers": 8,
+    "ffn_expansion_ratio": 2.6667,
+    "tie_word_embeddings": True,
+    "max_position_embeddings": 4096,
+    "rope_theta": 1000000.0,
+    "rope_scaling_factor": 10.0,
+    "enable_qk_norm": True,
+    "enable_sparse_attention": True,
+    "attention_sliding_window_size": 256,
+    "enable_hyper_residual": True,
+    "hyper_res_block_size": 4,
+    "hyper_res_alpha": 0.1,
+
+    # 训练核心超参数（固定15轮训练）
+    "batch_size_per_step": 2,
+    "gradient_accumulation_steps": 8,
+    "global_batch_size": 16,
+    "max_epochs": 15,
+    "base_lr": 3e-4,
+    "min_lr": 3e-5,
+    "warmup_steps_ratio": 0.01,
+    "enable_embedding_warmup": True,
+    "embedding_warmup_steps_ratio": 0.005,
+    "embedding_warmup_lr": 1e-3,
+
+    # 正则化配置
+    "enable_weight_decay": True,
+    "weight_decay": 0.1,
+    "enable_grad_clip": True,
+    "max_grad_norm": 1.0,
+    "enable_grad_noise_injection": True,
+    "grad_noise_eta": 0.3,
+    "grad_noise_gamma": 0.55,
+    "enable_stochastic_depth": True,
+    "stochastic_depth_drop_rate": 0.1,
+    "enable_r_drop": True,
+    "r_drop_alpha": 0.5,
+    "enable_z_loss": True,
+    "z_loss_coeff": 1e-4,
+    "enable_logit_clipping": True,
+    "max_logit_value": 30.0,
+    "enable_layer_wise_weight_decay": False,
+    "layer_decay_rate": 0.8,
+
+    # 训练流程控制
+    "early_stop_patience": 5,
+    "early_stop_min_delta": 0.005,
+    "val_interval": 200,
+    "log_interval": 10,
+    "save_interval": 1000,
+    "max_val_batches": 50,
+    "max_test_batches": 100,
+    "enable_ema": True,
+    "ema_decay": 0.9999,
+    "checkpoint_dir": "./checkpoints",
+    "log_dir": "./logs",
+    "final_model_save_path": "./checkpoints/final_gpt_model.pdparams",
+    "enable_auto_resume": True,
+})
+
+# 自动创建所有所需目录
+for dir_path in [CONFIG.corpus_dir, CONFIG.preprocessed_data_dir, CONFIG.tokenizer_dir, CONFIG.checkpoint_dir, CONFIG.log_dir]:
+    os.makedirs(dir_path, exist_ok=True)
+
+# ====================================== 核心工具函数 ======================================
+# 余弦退火学习率计算函数，支持线性预热
+def get_lr(current_step: int, total_steps: int, warmup_steps: int, base_lr: float, min_lr: float) -> float:
+    # 预热阶段线性增长学习率，预热后余弦退火平滑衰减
+    if current_step < warmup_steps:
+        return base_lr * current_step / warmup_steps
+    # 余弦退火核心计算逻辑
+    progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return max(min_lr, base_lr * cosine_decay)
+
+# 全局随机种子固定，保证训练结果可复现
+def set_random_seed(seed: int = 3407, deterministic: bool = True):
+    random.seed(seed)
+    np.random.seed(seed)
+    paddle.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        paddle.set_flags({"FLAGS_cpu_deterministic": True, "FLAGS_deterministic": True})
+
+# CPU环境极致优化配置
+def setup_cpu_env(config: EasyDict):
+    cpu_cores = config.physical_cpu_cores
+    # MKL-DNN线程与指令集优化，提升CPU训练速度
+    os.environ["OMP_NUM_THREADS"] = str(cpu_cores)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_cores)
+    os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+    if config.enable_mkldnn:
+        os.environ["FLAGS_use_mkldnn"] = "1"
+        paddle.set_flags({"FLAGS_use_mkldnn": True})
+    # 内存优化配置，防止OOM
+    os.environ["FLAGS_eager_delete_tensor_gb"] = "0.0"
+    os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+    paddle.set_num_threads(cpu_cores)
+    paddle.set_num_interop_threads(max(2, cpu_cores//4))
+    # 固定随机种子
+    set_random_seed(config.seed, config.deterministic)
+
+# 初始化CPU环境
+setup_cpu_env(CONFIG)
+
+# ====================================== 日志系统 ======================================
+# 全局日志初始化，支持本地文件轮转+控制台输出+wandb同步
+def setup_logger(config: EasyDict) -> logging.Logger:
+    log_file = os.path.join(config.log_dir, "train_full.log")
+    logger = logging.getLogger("gpt_pretrain")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    # 清空已有handler避免重复打印
+    if logger.handlers:
+        logger.handlers.clear()
+    # 日志格式定义
+    log_format = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    # 控制台日志handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(log_format)
+    logger.addHandler(console_handler)
+    # 文件日志handler，支持自动轮转
+    file_handler = RotatingFileHandler(log_file, maxBytes=200*1024*1024, backupCount=50, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+    # 启动日志打印
+    logger.info("="*100)
+    logger.info(f"GPT预训练启动，训练轮数：{config.max_epochs}轮，CPU核心数：{config.physical_cpu_cores}")
+    logger.info("="*100)
+    return logger
+
+# 训练指标管理，支持本地存储+wandb同步+数值异常检测
+class MetricManager:
+    def __init__(self, metric_file: str, logger: logging.Logger, config: EasyDict):
+        self.metric_file = metric_file
+        self.logger = logger
+        self.config = config
+        self.metric_history = []
+        self.best_val_ppl = float("inf")
+        self.nan_inf_count = 0
+        self.max_nan_inf_tolerance = 5
+        # 初始化指标文件
+        if not os.path.exists(metric_file):
+            with open(metric_file, "w", encoding="utf-8") as f:
+                f.write("")
+        # 断点续训加载历史指标
+        if config.enable_auto_resume and os.path.exists(metric_file):
+            self._load_history()
+
+    def _load_history(self):
+        try:
+            with open(self.metric_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self.metric_history.append(json.loads(line))
+            if self.metric_history:
+                self.best_val_ppl = min([m.get("val_ppl", float("inf")) for m in self.metric_history])
+                self.logger.info(f"历史指标加载完成，最优验证PPL：{self.best_val_ppl:.4f}")
+        except Exception as e:
+            self.logger.warning(f"历史指标加载失败：{str(e)}")
+
+    def _check_nan_inf(self, metrics: Dict) -> bool:
+        if not self.config.enable_nan_inf_detection:
+            return True
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.number)):
+                if np.isnan(value) or np.isinf(value):
+                    self.nan_inf_count += 1
+                    self.logger.error(f"数值异常：{key} 出现NaN/Inf，累计异常次数：{self.nan_inf_count}")
+                    if self.nan_inf_count >= self.max_nan_inf_tolerance:
+                        return False
+        return True
+
+    def log_metrics(self, step: int, epoch: int, metrics: Dict, is_warmup: bool = False) -> Tuple[bool, Dict]:
+        # 数值异常检测
+        is_normal = self._check_nan_inf(metrics)
+        if not is_normal:
+            return False, metrics
+        # 补充元数据
+        metric_data = {"timestamp": datetime.now().isoformat(), "step": step, "epoch": epoch, "is_warmup": is_warmup, **metrics}
+        self.metric_history.append(metric_data)
+        # 写入本地文件
+        try:
+            with open(self.metric_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(metric_data, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.logger.error(f"指标写入失败：{str(e)}")
+        # 同步到wandb
+        if CONFIG.enable_wandb and WANDB_AVAILABLE and step % CONFIG.wandb_log_interval == 0:
+            wandb.log(metric_data, step=step)
+        # 更新最优指标
+        if not is_warmup and "val_ppl" in metrics and metrics["val_ppl"] < self.best_val_ppl:
+            self.best_val_ppl = metrics["val_ppl"]
+            self.logger.info(f"新最优模型，验证PPL降至：{self.best_val_ppl:.4f}")
+        return True, metric_data
+
+# 初始化日志与指标管理器
+LOGGER = setup_logger(CONFIG)
+TRAIN_METRIC_MANAGER = MetricManager(os.path.join(CONFIG.log_dir, "train_metrics.jsonl"), LOGGER, CONFIG)
+TEST_METRIC_MANAGER = MetricManager(os.path.join(CONFIG.log_dir, "test_metrics.jsonl"), LOGGER, CONFIG)
+WARMUP_METRIC_MANAGER = MetricManager(os.path.join(CONFIG.log_dir, "warmup_metrics.jsonl"), LOGGER, CONFIG)
+
+# ====================================== 模型核心模块 ======================================
+# RMSNorm归一化层，计算效率优于LayerNorm
+class RMSNorm(nn.Layer):
+    def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.affine = affine
+        self.weight = self.create_parameter(shape=[dim], default_initializer=nn.initializer.Constant(1.0)) if affine else None
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        input_dtype = x.dtype
+        x = x.cast(paddle.float32)
+        norm = paddle.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = x * norm
+        if self.weight is not None:
+            x = x * self.weight
+        return x.cast(input_dtype)
+
+# SwiGLU激活函数，Transformer主流最优GLU变体
+class SwiGLU(nn.Layer):
+    def __init__(self, dim: int, hidden_dim: int, numerical_stabilize: bool = True):
+        super().__init__()
+        self.numerical_stabilize = numerical_stabilize
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias_attr=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias_attr=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias_attr=False)
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        if self.numerical_stabilize:
+            x = paddle.clip(x, min=-100.0, max=100.0)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+# YaRN-RoPE位置编码，支持超长上下文扩展
+class YarnRotaryEmbedding(nn.Layer):
+    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 1000000.0, scaling_factor: float = 10.0):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.scaling_factor = scaling_factor
+        inv_freq = 1.0 / (theta ** (paddle.arange(0, head_dim, 2).astype(paddle.float32) / head_dim))
+        wavelen = 2 * np.pi / inv_freq
+        inv_freq_mask = (wavelen < max_seq_len / 32).astype(paddle.float32)
+        inv_freq = inv_freq * (inv_freq_mask + (1 - inv_freq_mask) / scaling_factor)
+        self.register_buffer("inv_freq", inv_freq)
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _update_cos_sin_cache(self, seq_len: int, dtype: paddle.dtype):
+        if seq_len > self._seq_len_cached:
+            self._seq_len_cached = seq_len
+            t = paddle.arange(seq_len, dtype=paddle.float32)
+            freqs = paddle.outer(t, self.inv_freq)
+            emb = paddle.concat([freqs, freqs], axis=-1)
+            self._cos_cached = emb.cos()[None, None, :, :].cast(dtype)
+            self._sin_cached = emb.sin()[None, None, :, :].cast(dtype)
+        return self._cos_cached, self._sin_cached
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        b, h, s, d = x.shape
+        cos, sin = self._update_cos_sin_cache(s, x.dtype)
+        cos = cos[:, :, :s, :]
+        sin = sin[:, :, :s, :]
+        x1, x2 = x.chunk(2, axis=-1)
+        x_rot = paddle.concat([-x2, x1], axis=-1)
+        return (x * cos + x_rot * sin).cast(x.dtype)
+
+# GQA分组查询+滑动窗口稀疏注意力层
+class GQASparseAttention(nn.Layer):
+    def __init__(self, dim: int, n_head: int, n_kv_head: int, max_seq_len: int, config: EasyDict):
+        super().__init__()
+        self.dim = dim
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        self.head_dim = dim // n_head
+        self.kv_repeat = n_head // n_kv_head
+        self.config = config
+        # 线性投影层
+        self.q_proj = nn.Linear(dim, n_head * self.head_dim, bias_attr=False)
+        self.k_proj = nn.Linear(dim, n_kv_head * self.head_dim, bias_attr=False)
+        self.v_proj = nn.Linear(dim, n_kv_head * self.head_dim, bias_attr=False)
+        self.out_proj = nn.Linear(dim, dim, bias_attr=False)
+        # QK归一化
+        self.q_norm = RMSNorm(self.head_dim) if config.enable_qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if config.enable_qk_norm else None
+        # 位置编码
+        self.rope = YarnRotaryEmbedding(self.head_dim, max_seq_len, config.rope_theta, config.rope_scaling_factor)
+        # 注意力dropout
+        self.attn_dropout = nn.Dropout(0.0)
+        # 因果掩码缓存
+        self.register_buffer("causal_mask", paddle.tril(paddle.ones((max_seq_len, max_seq_len), dtype=paddle.bool)).reshape([1, 1, max_seq_len, max_seq_len]))
+
+    def forward(self, x: paddle.Tensor, attention_mask: Optional[paddle.Tensor] = None) -> paddle.Tensor:
+        b, s, _ = x.shape
+        # 线性投影与维度变换
+        q = self.q_proj(x).reshape([b, s, self.n_head, self.head_dim]).transpose([0, 2, 1, 3])
+        k = self.k_proj(x).reshape([b, s, self.n_kv_head, self.head_dim]).transpose([0, 2, 1, 3])
+        v = self.v_proj(x).reshape([b, s, self.n_kv_head, self.head_dim]).transpose([0, 2, 1, 3])
+        # QK归一化
+        if self.q_norm is not None and self.k_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        # 位置编码注入
+        q = self.rope(q)
+        k = self.rope(k)
+        # GQA分组重复
+        k = k.repeat_interleave(self.kv_repeat, axis=1)
+        v = v.repeat_interleave(self.kv_repeat, axis=1)
+        # 注意力分数计算
+        attn_scores = (q @ k.transpose([0, 1, 3, 2])) / (self.head_dim ** 0.5)
+        # Logit裁剪防止数值溢出
+        if self.config.enable_logit_clipping:
+            attn_scores = paddle.clip(attn_scores, min=-self.config.max_logit_value, max=self.config.max_logit_value)
+        # 因果掩码
+        causal_mask = self.causal_mask[:, :, :s, :s]
+        # 滑动窗口稀疏掩码
+        if self.config.enable_sparse_attention:
+            window_mask = paddle.ones_like(causal_mask)
+            for i in range(s):
+                window_start = max(0, i - self.config.attention_sliding_window_size)
+                window_mask[:, :, i, :window_start] = False
+            causal_mask = causal_mask & window_mask
+        # 自定义注意力掩码
+        if attention_mask is not None:
+            causal_mask = causal_mask & attention_mask
+        # 掩码填充与softmax
+        attn_scores = attn_scores.masked_fill(~causal_mask, -1e9)
+        attn_weights = F.softmax(attn_scores, axis=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        # 注意力输出
+        attn_output = (attn_weights @ v).transpose([0, 2, 1, 3]).reshape([b, s, self.dim])
+        return self.out_proj(attn_output)
+
+# 随机深度正则化层，缓解深层网络过拟合
+class StochasticDepth(nn.Layer):
+    def __init__(self, drop_rate: float = 0.1, layer_idx: int = 0, total_layers: int = 8):
+        super().__init__()
+        self.drop_rate = drop_rate * layer_idx / total_layers
+        self.keep_rate = 1.0 - self.drop_rate
+
+    def forward(self, x: paddle.Tensor, residual: paddle.Tensor) -> paddle.Tensor:
+        if not self.training or self.drop_rate <= 0.0:
+            return x + residual
+        mask = paddle.rand([x.shape[0], 1, 1], dtype=x.dtype) < self.keep_rate
+        x = paddle.where(mask, x / self.keep_rate, paddle.zeros_like(x))
+        return x + residual
+
+# Transformer解码器块
+class DecoderBlock(nn.Layer):
+    def __init__(self, layer_idx: int, config: EasyDict):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
+        self.dim = config.embed_dim
+        # 注意力分支
+        self.norm1 = RMSNorm(config.embed_dim)
+        self.attn = GQASparseAttention(config.embed_dim, config.num_q_heads, config.num_kv_heads, config.max_position_embeddings, config)
+        # FFN分支
+        self.norm2 = RMSNorm(config.embed_dim)
+        self.ffn = SwiGLU(config.embed_dim, int(config.embed_dim * config.ffn_expansion_ratio))
+        # 随机深度正则化
+        self.stochastic_depth = StochasticDepth(config.stochastic_depth_drop_rate, layer_idx, config.num_layers) if config.enable_stochastic_depth else None
+        # 梯度检查点，节省内存
+        self.use_gradient_checkpointing = config.enable_gradient_checkpointing
+
+    def forward(self, x: paddle.Tensor, attention_mask: Optional[paddle.Tensor] = None) -> paddle.Tensor:
+        # 注意力残差分支
+        residual = x
+        x = self.norm1(x)
+        if self.use_gradient_checkpointing and self.training:
+            attn_out = recompute(self.attn, x, attention_mask)
+        else:
+            attn_out = self.attn(x, attention_mask)
+        # 残差连接
+        if self.stochastic_depth is not None:
+            x = self.stochastic_depth(attn_out, residual)
+        else:
+            x = residual + attn_out
+        # FFN残差分支
+        residual = x
+        x = self.norm2(x)
+        if self.use_gradient_checkpointing and self.training:
+            ffn_out = recompute(self.ffn, x)
+        else:
+            ffn_out = self.ffn(x)
+        # 残差连接
+        if self.stochastic_depth is not None:
+            x = self.stochastic_depth(ffn_out, residual)
+        else:
+            x = residual + ffn_out
+        return x
+
+# GPT主干模型
+class GPTBackbone(nn.Layer):
+    def __init__(self, config: EasyDict, vocab_size: int):
+        super().__init__()
+        self.config = config
+        self.vocab_size = vocab_size
+        self.dim = config.embed_dim
+        # Token嵌入层
+        self.token_embedding = nn.Embedding(vocab_size, config.embed_dim)
+        # 解码器层
+        self.decoder_layers = nn.LayerList([DecoderBlock(layer_idx, config) for layer_idx in range(config.num_layers)])
+        # 最终归一化
+        self.final_norm = RMSNorm(config.embed_dim)
+        # 语言模型头
+        self.lm_head = nn.Linear(config.embed_dim, vocab_size, bias_attr=False)
+        # 权重共享，减少参数量
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.token_embedding.weight
+        # 超残差连接配置
+        self.enable_hyper_residual = config.enable_hyper_residual
+        self.hyper_res_block_size = config.hyper_res_block_size
+        self.hyper_res_alpha = config.hyper_res_alpha
+        # 权重初始化
+        self.apply(self._init_weights)
+
+    def _init_weights(self, layer):
+        if isinstance(layer, nn.Linear):
+            std = 0.02 / (2 * self.config.num_layers) ** 0.5 if hasattr(layer, "out_proj") else 0.02
+            nn.initializer.Normal(mean=0.0, std=std)(layer.weight)
+            if layer.bias is not None:
+                nn.initializer.Constant(0.0)(layer.bias)
+        elif isinstance(layer, nn.Embedding):
+            nn.initializer.Normal(mean=0.0, std=0.02)(layer.weight)
+
+    def forward(self, input_ids: paddle.Tensor, return_logits_only: bool = False) -> Union[paddle.Tensor, Tuple[paddle.Tensor, paddle.Tensor]]:
+        b, s = input_ids.shape
+        h = self.token_embedding(input_ids)
+        # 超残差连接，稳定深层网络训练
+        hyper_residual = None
+        for layer_idx, layer in enumerate(self.decoder_layers):
+            h = layer(h)
+            if self.enable_hyper_residual:
+                if layer_idx % self.hyper_res_block_size == 0:
+                    if hyper_residual is not None:
+                        h = h + self.hyper_res_alpha * hyper_residual
+                    hyper_residual = h
+        # 最终归一化与输出
+        h = self.final_norm(h)
+        logits = self.lm_head(h)
+        # Logit裁剪防止数值溢出
+        if self.config.enable_logit_clipping:
+            logits = paddle.clip(logits, min=-self.config.max_logit_value, max=self.config.max_logit_value)
+        if return_logits_only:
+            return logits
+        # Z-Loss计算，稳定训练
+        z_loss = paddle.to_tensor(0.0)
+        if self.config.enable_z_loss:
+            z_loss = self.config.z_loss_coeff * paddle.square(paddle.logsumexp(logits, axis=-1)).mean()
+        return logits, z_loss
+
+# ====================================== 正则化工具函数 ======================================
+# R-Drop损失函数，提升模型泛化能力
+def r_drop_loss(logits1: paddle.Tensor, logits2: paddle.Tensor, alpha: float = 0.5) -> paddle.Tensor:
+    b, s, v = logits1.shape
+    logits1 = logits1.reshape([-1, v])
+    logits2 = logits2.reshape([-1, v])
+    p = F.log_softmax(logits1, axis=-1)
+    q = F.softmax(logits2, axis=-1)
+    p2 = F.log_softmax(logits2, axis=-1)
+    q2 = F.softmax(logits1, axis=-1)
+    kl_loss1 = F.kl_div(p, q, reduction="batchmean")
+    kl_loss2 = F.kl_div(p2, q2, reduction="batchmean")
+    return alpha * (kl_loss1 + kl_loss2) / 2
+
+# 分层权重衰减参数分组，适配LLM训练最佳实践
+def get_layer_wise_weight_decay_params(model: nn.Layer, config: EasyDict, is_warmup: bool = False) -> List[Dict]:
+    if not config.enable_layer_wise_weight_decay or is_warmup:
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.stop_gradient:
+                if param.ndim == 1 or "norm" in name.lower() or "bias" in name.lower():
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+        return [
+            {"params": decay_params, "weight_decay": config.weight_decay if not is_warmup else 0.0},
+            {"params": no_decay_params, "weight_decay": 0.0}
+        ]
+    # 分层权重衰减逻辑
+    num_layers = config.num_layers
+    decay_rate = config.layer_decay_rate
+    base_weight_decay = config.weight_decay
+    param_groups = []
+    # 嵌入层
+    embed_params = [p for n, p in model.named_parameters() if "token_embedding" in n and not p.stop_gradient]
+    if embed_params:
+        param_groups.append({"params": embed_params, "weight_decay": base_weight_decay * (decay_rate ** (num_layers + 1))})
+    # 解码器层
+    for layer_idx in range(num_layers):
+        layer_params = [p for n, p in model.named_parameters() if f"decoder_layers.{layer_idx}." in n and not p.stop_gradient]
+        if layer_params:
+            layer_decay = base_weight_decay * (decay_rate ** (num_layers - layer_idx))
+            param_groups.append({"params": layer_params, "weight_decay": layer_decay})
+    # 输出层
+    lm_head_params = [p for n, p in model.named_parameters() if "lm_head" in n and not p.stop_gradient]
+    if lm_head_params:
+        param_groups.append({"params": lm_head_params, "weight_decay": base_weight_decay})
+    # 无衰减参数
+    no_decay_params = [p for n, p in model.named_parameters() if not p.stop_gradient and (p.ndim == 1 or "norm" in n.lower() or "bias" in n.lower())]
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return param_groups
+
+# 梯度噪声注入器，提升模型泛化能力
+class GradientNoiseInjector:
+    def __init__(self, eta: float = 0.3, gamma: float = 0.55):
+        self.eta = eta
+        self.gamma = gamma
+
+    def inject(self, params: List[nn.Parameter], step: int):
+        if not in_dygraph_mode():
+            return
+        noise_scale = self.eta / ((1 + step) ** self.gamma)
+        for param in params:
+            if param.grad is not None and not param.stop_gradient:
+                noise = paddle.randn(shape=param.grad.shape, dtype=param.grad.dtype) * noise_scale
+                param.grad += noise
+
+# EMA权重滑动平均，提升模型收敛效果
+class EMA:
+    def __init__(self, model: nn.Layer, decay: float = 0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if not param.stop_gradient:
+                self.shadow[name] = param.clone().detach()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.detach()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                self.backup[name] = param.clone()
+                param.set_value(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if not param.stop_gradient:
+                param.set_value(self.backup[name])
+        self.backup = {}
+
+# ====================================== 数据处理模块 ======================================
+# 多格式语料加载器
+class CorpusLoader:
+    SUPPORTED_EXTENSIONS = {".txt", ".jsonl", ".parquet"}
+    def __init__(self, config: EasyDict, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.text_key = ["text", "content", "document", "paragraph", "article"]
+        self.num_workers = max(1, config.physical_cpu_cores // 2)
+
+    def _scan_corpus_files(self) -> List[str]:
+        corpus_files = []
+        for root, _, files in os.walk(self.config.corpus_dir):
+            for file in files:
+                file_ext = os.path.splitext(file)[1].lower()
+                if file_ext in self.SUPPORTED_EXTENSIONS:
+                    corpus_files.append(os.path.join(root, file))
+        self.logger.info(f"扫描到语料文件：{len(corpus_files)}个")
+        return corpus_files
+
+    def _load_single_file(self, file_path: str) -> List[str]:
+        file_ext = os.path.splitext(file_path)[1].lower()
+        paragraphs = []
+        try:
+            if file_ext == ".txt":
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if len(p.strip()) > 20]
+            elif file_ext == ".jsonl":
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        data = json.loads(line)
+                        for key in self.text_key:
+                            if key in data and isinstance(data[key], str):
+                                text = data[key].strip()
+                                if len(text) > 20:
+                                    paragraphs.append(text)
+                                break
+            elif file_ext == ".parquet":
+                parquet_file = pq.ParquetFile(file_path)
+                for batch in parquet_file.iter_batches(batch_size=10000):
+                    df = batch.to_pandas()
+                    for col in df.columns:
+                        if col.lower() in self.text_key:
+                            texts = df[col].dropna().astype(str).tolist()
+                            paragraphs.extend([t.strip() for t in texts if len(t.strip()) > 20])
+                            break
+            return paragraphs
+        except Exception as e:
+            self.logger.error(f"文件加载失败：{file_path}，错误：{str(e)}")
+            return []
+
+    def load_all_corpus(self) -> List[str]:
+        corpus_files = self._scan_corpus_files()
+        if len(corpus_files) == 0:
+            raise FileNotFoundError(f"语料目录{self.config.corpus_dir}中无有效文件")
+        with Pool(self.num_workers) as pool:
+            results = list(tqdm(pool.imap(self._load_single_file, corpus_files), total=len(corpus_files), desc="语料加载"))
+            pool.close()
+            pool.join()
+        all_paragraphs = []
+        for res in results:
+            all_paragraphs.extend(res)
+        self.logger.info(f"语料加载完成，总段落数：{len(all_paragraphs)}")
+        return all_paragraphs
+
+# 语料清洗器
+class CorpusCleaner:
+    def __init__(self, config: EasyDict, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.min_text_length = config.min_text_length
+        self.max_text_length = config.max_text_length
+        self.support_languages = ["zh", "en", "ja", "ko"]
+        # 清洗正则规则
+        self.html_re = re.compile(r'<[^>]+>', re.S)
+        self.url_re = re.compile(r'https?://\S+|www.\S+', re.S)
+        self.duplicate_punct_re = re.compile(r'([。！？，；：.!?,;])\1+', re.S)
+        self.whitespace_re = re.compile(r'\s+', re.S)
+        self.invalid_char_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', re.S)
+
+    def clean_single_text(self, text: str) -> Tuple[bool, str]:
+        try:
+            # 基础字符清洗
+            text = text.replace('\u3000',' ').replace('\u200B','')
+            text = self.invalid_char_re.sub('', text)
+            text = self.html_re.sub('', text)
+            text = self.url_re.sub('', text)
+            text = self.duplicate_punct_re.sub(r'\1', text)
+            text = self.whitespace_re.sub(' ', text)
+            text = text.strip()
+            # 长度过滤
+            if len(text) < self.min_text_length or len(text) > self.max_text_length:
+                return False, "长度不符合"
+            # 语言过滤
+            try:
+                lang = langdetect.detect(text)
+                if lang not in self.support_languages:
+                    return False, "非支持语言"
+            except LangDetectException:
+                return False, "语言检测失败"
+            return True, text
+        except Exception as e:
+            return False, f"清洗异常：{str(e)}"
+
+    def deduplicate_corpus(self, texts: List[str]) -> List[str]:
+        # 精确去重
+        seen_hash = set()
+        unique_texts = []
+        for text in tqdm(texts, desc="精确去重"):
+            text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if text_hash not in seen_hash:
+                seen_hash.add(text_hash)
+                unique_texts.append(text)
+        self.logger.info(f"精确去重完成：{len(texts)} → {len(unique_texts)}")
+        # Simhash模糊去重
+        final_texts = []
+        simhash_index = SimhashIndex([], k=3)
+        for idx, text in enumerate(tqdm(unique_texts, desc="模糊去重")):
+            sim_hash = Simhash(text)
+            if not simhash_index.get_near_dups(sim_hash):
+                simhash_index.add(f"text_{idx}", sim_hash)
+                final_texts.append(text)
+        self.logger.info(f"模糊去重完成：{len(unique_texts)} → {len(final_texts)}")
+        return final_texts
+
+    def clean_full_corpus(self, texts: List[str]) -> List[str]:
+        with Pool(max(1, self.config.physical_cpu_cores//2)) as pool:
+            results = list(tqdm(pool.imap(self.clean_single_text, texts), total=len(texts), desc="语料清洗"))
+            pool.close()
+            pool.join()
+        valid_texts = [cleaned for is_valid, cleaned in results if is_valid]
+        self.logger.info(f"清洗完成，有效文本数：{len(valid_texts)}")
+        return self.deduplicate_corpus(valid_texts)
+
+# BPE分词器管理器
+class GPTTokenizerManager:
+    def __init__(self, config: EasyDict, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.model_path = os.path.join(config.tokenizer_dir, "gpt_bpe.model")
+        self.sp = None
+        # 特殊Token定义
+        self.special_tokens = {"<s>": 0, "</s>": 1, "<pad>": 2, "<unk>": 3}
+        self.bos_id = self.special_tokens["<s>"]
+        self.eos_id = self.special_tokens["</s>"]
+        self.pad_id = self.special_tokens["<pad>"]
+        self.unk_id = self.special_tokens["<unk>"]
+        # 加载已有模型
+        if os.path.exists(self.model_path):
+            self.load()
+
+    def train(self, corpus_texts: List[str]):
+        self.logger.info("开始训练BPE分词器")
+        corpus_file = os.path.join(self.config.preprocessed_data_dir, "tokenizer_train_corpus.txt")
+        with open(corpus_file, "w", encoding="utf-8") as f:
+            for text in tqdm(corpus_texts, desc="生成分词器训练语料"):
+                f.write(text + "\n")
+        # 训练BPE模型
+        spm.SentencePieceTrainer.train(
+            input=corpus_file,
+            model_prefix=os.path.join(self.config.tokenizer_dir, "gpt_bpe"),
+            vocab_size=self.config.vocab_size,
+            character_coverage=self.config.character_coverage,
+            model_type="bpe",
+            bos_id=self.bos_id,
+            eos_id=self.eos_id,
+            pad_id=self.pad_id,
+            unk_id=self.unk_id,
+            bos_piece="<s>",
+            eos_piece="</s>",
+            pad_piece="<pad>",
+            unk_piece="<unk>",
+            byte_fallback=True,
+            split_digits=True,
+            num_threads=self.config.physical_cpu_cores,
+            hard_vocab_limit=False
+        )
+        self.load()
+        self.logger.info(f"分词器训练完成，词汇表大小：{self.vocab_size}")
+        os.remove(corpus_file)
+
+    def load(self):
+        self.sp = spm.SentencePieceProcessor(model_file=self.model_path)
+        assert self.sp.bos_id() == self.bos_id, "BOS ID不匹配"
+        assert self.sp.eos_id() == self.eos_id, "EOS ID不匹配"
+
+    @property
+    def vocab_size(self) -> int:
+        return self.sp.vocab_size()
+
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = True) -> List[int]:
+        ids = self.sp.encode(text, out_type=int)
+        if add_bos:
+            ids = [self.bos_id] + ids
+        if add_eos:
+            ids = ids + [self.eos_id]
+        return ids
+
+    def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
+        if skip_special_tokens:
+            ids = [i for i in ids if i not in [self.bos_id, self.eos_id, self.pad_id]]
+        return self.sp.decode(ids)
+
+# Token缓存与流式数据集管理器
+class TokenCacheManager:
+    def __init__(self, config: EasyDict, tokenizer: GPTTokenizerManager, logger: logging.Logger):
+        self.config = config
+        self.tokenizer = tokenizer
+        self.logger = logger
+        self.max_seq_len = config.max_seq_len
+        self.cache_dir = config.preprocessed_data_dir
+        self.train_cache_path = os.path.join(self.cache_dir, "train_tokens.npy")
+        self.val_cache_path = os.path.join(self.cache_dir, "val_tokens.npy")
+        self.test_cache_path = os.path.join(self.cache_dir, "test_tokens.npy")
+        self.meta_path = os.path.join(self.cache_dir, "meta.json")
+
+    def process_corpus_to_token_stream(self, cleaned_texts: List[str]) -> np.ndarray:
+        all_doc_tokens = []
+        for doc in tqdm(cleaned_texts, desc="文档分词"):
+            doc_tokens = self.tokenizer.encode(doc, add_bos=False, add_eos=True)
+            if len(doc_tokens) >= 10:
+                all_doc_tokens.extend(doc_tokens)
+        self.logger.info(f"Token流构建完成，总token数：{len(all_doc_tokens)}")
+        return np.array(all_doc_tokens, dtype=np.int64)
+
+    def build_token_cache(self, cleaned_texts: List[str]) -> Tuple[str, str, str]:
+        if self.is_cache_valid():
+            self.logger.info("Token缓存有效，直接复用")
+            return self.train_cache_path, self.val_cache_path, self.test_cache_path
+        # 处理全量语料为token流
+        all_tokens = self.process_corpus_to_token_stream(cleaned_texts)
+        if len(all_tokens) < self.max_seq_len * 100:
+            raise ValueError(f"有效token数不足，无法训练")
+        # 训练/验证/测试集划分
+        total_len = len(all_tokens)
+        train_split = int(total_len * self.config.train_ratio)
+        val_split = int(total_len * (self.config.train_ratio + self.config.val_ratio))
+        train_tokens = all_tokens[:train_split]
+        val_tokens = all_tokens[train_split:val_split]
+        test_tokens = all_tokens[val_split:]
+        # 保存缓存文件
+        np.save(self.train_cache_path, train_tokens)
+        np.save(self.val_cache_path, val_tokens)
+        np.save(self.test_cache_path, test_tokens)
+        # 保存元数据
+        meta = {"total_tokens": len(all_tokens), "train_tokens": len(train_tokens), "val_tokens": len(val_tokens), "test_tokens": len(test_tokens), "max_seq_len": self.max_seq_len, "vocab_size": self.tokenizer.vocab_size}
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        self.logger.info(f"Token缓存构建完成，训练集{len(train_tokens)}token")
+        return self.train_cache_path, self.val_cache_path, self.test_cache_path
+
+    def is_cache_valid(self) -> bool:
+        if not all([os.path.exists(p) for p in [self.train_cache_path, self.val_cache_path, self.test_cache_path, self.meta_path]]):
+            return False
+        try:
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            return meta["max_seq_len"] == self.max_seq_len and meta["vocab_size"] == self.tokenizer.vocab_size
+        except:
+            return False
+
+    def load_train_tokens(self) -> np.ndarray:
+        return np.load(self.train_cache_path, mmap_mode="r" if self.config.enable_mmap_token else None)
+
+    def load_val_tokens(self) -> np.ndarray:
+        return np.load(self.val_cache_path, mmap_mode="r" if self.config.enable_mmap_token else None)
+
+    def load_test_tokens(self) -> np.ndarray:
+        return np.load(self.test_cache_path, mmap_mode="r" if self.config.enable_mmap_token else None)
+
+# 流式预训练数据集，内存友好型
+class StreamingPretrainDataset(IterableDataset):
+    def __init__(self, token_array: np.ndarray, max_seq_len: int, eos_id: int, config: EasyDict, is_validation: bool = False):
+        super().__init__()
+        self.token_array = token_array
+        self.max_seq_len = max_seq_len
+        self.eos_id = eos_id
+        self.config = config
+        self.is_validation = is_validation
+        self.chunk_size = max_seq_len + 1
+        self.doc_boundaries = np.where(self.token_array == eos_id)[0] + 1
+
+    def __iter__(self) -> Generator[Tuple[paddle.Tensor, paddle.Tensor], None, None]:
+        total_length = len(self.token_array)
+        current_idx = 0 if self.is_validation else random.randint(0, self.chunk_size // 2)
+        while current_idx + self.chunk_size < total_length:
+            # 文档边界感知切分，避免跨文档伪关联
+            if self.config.doc_boundary_aware:
+                boundary_in_chunk = self.doc_boundaries[(self.doc_boundaries > current_idx) & (self.doc_boundaries < current_idx + self.chunk_size)]
+                if len(boundary_in_chunk) > 0:
+                    current_idx = boundary_in_chunk[-1]
+                    if current_idx + self.chunk_size >= total_length:
+                        break
+            # 构建自回归输入与目标
+            end_idx = current_idx + self.chunk_size
+            token_chunk = self.token_array[current_idx:end_idx]
+            input_ids = token_chunk[:-1]
+            target_ids = token_chunk[1:]
+            yield (paddle.to_tensor(input_ids, dtype=paddle.int64), paddle.to_tensor(target_ids, dtype=paddle.int64))
+            current_idx += self.chunk_size - 1
+
+    def __len__(self) -> int:
+        return len(self.token_array) // (self.chunk_size - 1)
+
+# ====================================== 训练工具函数 ======================================
+# 断点保存函数，原子写入避免文件损坏
+def save_checkpoint(config: EasyDict, model: nn.Layer, optimizer: paddle.optimizer.Optimizer, ema: Optional[EMA], tokenizer: GPTTokenizerManager, global_step: int, epoch: int, val_ppl: float, is_best: bool = False):
+    checkpoint = {
+        "config": dict(config),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "ema_shadow": ema.shadow if ema is not None else None,
+        "tokenizer_vocab_size": tokenizer.vocab_size,
+        "global_step": global_step,
+        "epoch": epoch,
+        "val_ppl": val_ppl,
+        "timestamp": datetime.now().isoformat()
+    checkpoint = {
+        "config": dict(config),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "ema_shadow": ema.shadow if ema is not None else None,
+        "tokenizer_vocab_size": tokenizer.vocab_size,
+        "global_step": global_step,
+        "epoch": epoch,
+        "val_ppl": val_ppl,
+        "timestamp": datetime.now().isoformat()
+    }
+    # 原子写入避免文件损坏
+    temp_path = os.path.join(config.checkpoint_dir, "temp_checkpoint.pdparams")
+    latest_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pdparams")
+    paddle.save(checkpoint, temp_path)
+    if os.path.exists(latest_path):
+        os.replace(temp_path, latest_path)
+    else:
+        os.rename(temp_path, latest_path)
+    LOGGER.info(f"断点保存完成，步数：{global_step}")
+    # 保存最优模型
+    if is_best:
+        best_path = os.path.join(config.checkpoint_dir, "best_checkpoint.pdparams")
+        shutil.copyfile(latest_path, best_path)
+        LOGGER.info(f"最优模型更新，验证PPL：{val_ppl:.4f}")
+    # 保存到wandb artifacts
+    if config.enable_wandb and WANDB_AVAILABLE and config.wandb_save_artifact:
+        artifact = wandb.Artifact(f"gpt_model_step_{global_step}", type="model")
+        artifact.add_file(latest_path)
+        wandb.log_artifact(artifact)
+
+# 断点加载函数，支持断点续训
+def load_checkpoint(config: EasyDict, model: nn.Layer, optimizer: paddle.optimizer.Optimizer, ema: Optional[EMA]) -> Tuple[int, int, float]:
+    latest_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pdparams")
+    if not os.path.exists(latest_path) or not config.enable_auto_resume:
+        LOGGER.info("未找到断点，从头开始训练")
+        return 0, 0, float("inf")
+    LOGGER.info(f"加载断点：{latest_path}")
+    checkpoint = paddle.load(latest_path)
+    model.set_state_dict(checkpoint["model_state_dict"])
+    optimizer.set_state_dict(checkpoint["optimizer_state_dict"])
+    if ema is not None and checkpoint["ema_shadow"] is not None:
+        ema.shadow = checkpoint["ema_shadow"]
+    global_step = checkpoint["global_step"]
+    start_epoch = checkpoint["epoch"]
+    best_val_ppl = checkpoint["val_ppl"]
+    LOGGER.info(f"断点加载完成，起始步数：{global_step}，起始轮次：{start_epoch}")
+    return global_step, start_epoch, best_val_ppl
+
+# 模型评估函数，返回损失与困惑度PPL
+def evaluate(model: nn.Layer, data_loader: DataLoader, vocab_size: int, ema: Optional[EMA] = None, max_batches: int = None) -> Tuple[float, float]:
+    if ema is not None:
+        ema.apply_shadow()
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    with paddle.no_grad():
+        for batch_idx, (x, y) in enumerate(data_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            logits, z_loss = model(x)
+            ce_loss = F.cross_entropy(logits.reshape([-1, vocab_size]), y.reshape([-1]))
+            batch_loss = (ce_loss + z_loss).numpy()[0]
+            total_loss += batch_loss * len(x)
+            total_samples += len(x)
+    if ema is not None:
+        ema.restore()
+    avg_loss = total_loss / total_samples
+    val_ppl = np.exp(avg_loss)
+    model.train()
+    return avg_loss, val_ppl
+
+# 嵌入层预热函数，稳定训练初期
+def embedding_warmup_stage(model: GPTBackbone, train_loader: DataLoader, config: EasyDict, tokenizer: GPTTokenizerManager) -> GPTBackbone:
+    if not config.enable_embedding_warmup:
+        LOGGER.info("跳过嵌入层预热")
+        return model
+    # 计算预热步数
+    total_train_samples = len(train_loader.dataset)
+    warmup_steps = int(total_train_samples * config.embedding_warmup_steps_ratio)
+    warmup_steps = max(100, warmup_steps)
+    LOGGER.info(f"开始嵌入层预热，总步数：{warmup_steps}")
+    # 冻结主干网络，只训练嵌入层和LM头
+    for name, param in model.named_parameters():
+        if "token_embedding" not in name and "lm_head" not in name:
+            param.stop_gradient = True
+        else:
+            param.stop_gradient = False
+    # 预热阶段优化器
+    warmup_optimizer = paddle.optimizer.AdamW(
+        parameters=[p for p in model.parameters() if not p.stop_gradient],
+        learning_rate=config.embedding_warmup_lr,
+        beta1=0.9,
+        beta2=0.95,
+        epsilon=1e-8,
+        weight_decay=0.0
+    )
+    # 预热训练循环
+    model.train()
+    progress_bar = tqdm(range(warmup_steps), desc="嵌入层预热")
+    train_iter = iter(train_loader)
+    for step in progress_bar:
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
+        # 前向传播
+        logits, z_loss = model(x)
+        ce_loss = F.cross_entropy(logits.reshape([-1, tokenizer.vocab_size]), y.reshape([-1]))
+        total_loss = ce_loss + z_loss
+        # 反向传播
+        total_loss.backward()
+        warmup_optimizer.step()
+        warmup_optimizer.clear_grad()
+        # 日志记录
+        if step % config.log_interval == 0:
+            train_ppl = np.exp(ce_loss.numpy()[0])
+            metrics = {
+                "ce_loss": ce_loss.numpy()[0].item(),
+                "total_loss": total_loss.numpy()[0].item(),
+                "train_ppl": train_ppl.item()
+            }
+            WARMUP_METRIC_MANAGER.log_metrics(step, 0, metrics, is_warmup=True)
+            progress_bar.set_postfix({"loss": f"{total_loss.numpy()[0]:.4f}", "ppl": f"{train_ppl:.2f}"})
+    # 解冻所有参数
+    for param in model.parameters():
+        param.stop_gradient = False
+    LOGGER.info("嵌入层预热完成，所有参数已解冻")
+    return model
+
+# ====================================== 主训练流程 ======================================
+def main():
+    # wandb初始化
+    if CONFIG.enable_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=CONFIG.wandb_project,
+            entity=CONFIG.wandb_entity,
+            name=CONFIG.wandb_run_name,
+            config=dict(CONFIG),
+            mode="offline" if CONFIG.wandb_offline else "online"
+        )
+        LOGGER.info(f"wandb初始化完成，运行ID：{wandb.run.id}")
+
+    # 1. 语料加载与清洗
+    LOGGER.info("="*100)
+    LOGGER.info("第一步：语料加载与清洗")
+    LOGGER.info("="*100)
+    corpus_loader = CorpusLoader(CONFIG, LOGGER)
+    raw_texts = corpus_loader.load_all_corpus()
+    corpus_cleaner = CorpusCleaner(CONFIG, LOGGER)
+    cleaned_texts = corpus_cleaner.clean_full_corpus(raw_texts)
+    if len(cleaned_texts) == 0:
+        LOGGER.error("无有效语料，训练终止")
+        return
+
+    # 2. 分词器训练
+    LOGGER.info("="*100)
+    LOGGER.info("第二步：训练BPE分词器")
+    LOGGER.info("="*100)
+    tokenizer = GPTTokenizerManager(CONFIG, LOGGER)
+    if not os.path.exists(tokenizer.model_path):
+        tokenizer.train(cleaned_texts)
+
+    # 3. 数据集构建
+    LOGGER.info("="*100)
+    LOGGER.info("第三步：构建Token缓存与数据集")
+    LOGGER.info("="*100)
+    token_cache = TokenCacheManager(CONFIG, tokenizer, LOGGER)
+    train_cache_path, val_cache_path, test_cache_path = token_cache.build_token_cache(cleaned_texts)
+    # 加载Token流
+    train_tokens = token_cache.load_train_tokens()
+    val_tokens = token_cache.load_val_tokens()
+    test_tokens = token_cache.load_test_tokens()
+    # 构建数据集与DataLoader
+    train_dataset = StreamingPretrainDataset(train_tokens, CONFIG.max_seq_len, tokenizer.eos_id, CONFIG, is_validation=False)
+    val_dataset = StreamingPretrainDataset(val_tokens, CONFIG.max_seq_len, tokenizer.eos_id, CONFIG, is_validation=True)
+    test_dataset = StreamingPretrainDataset(test_tokens, CONFIG.max_seq_len, tokenizer.eos_id, CONFIG, is_validation=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG.batch_size_per_step,
+        num_workers=max(1, CONFIG.physical_cpu_cores//2),
+        prefetch_factor=4,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG.batch_size_per_step,
+        num_workers=max(1, CONFIG.physical_cpu_cores//4),
+        prefetch_factor=2,
+        drop_last=False
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=CONFIG.batch_size_per_step,
+        num_workers=max(1, CONFIG.physical_cpu_cores//4),
+        prefetch_factor=2,
+        drop_last=False
+    )
+    # 计算训练总步数
+    steps_per_epoch = len(train_loader) // CONFIG.gradient_accumulation_steps
+    total_train_steps = steps_per_epoch * CONFIG.max_epochs
+    warmup_steps = int(total_train_steps * CONFIG.warmup_steps_ratio)
+    LOGGER.info(f"训练总轮数：{CONFIG.max_epochs}轮，总步数：{total_train_steps}，预热步数：{warmup_steps}")
+
+    # 4. 模型初始化
+    LOGGER.info("="*100)
+    LOGGER.info("第四步：初始化GPT模型")
+    LOGGER.info("="*100)
+    model = GPTBackbone(CONFIG, tokenizer.vocab_size)
+    total_params = sum(p.numel() for p in model.parameters())
+    LOGGER.info(f"模型初始化完成，总参数量：{total_params/1e6:.2f}M")
+
+    # 5. 嵌入层预热
+    LOGGER.info("="*100)
+    LOGGER.info("第五步：嵌入层预热")
+    LOGGER.info("="*100)
+    model = embedding_warmup_stage(model, train_loader, CONFIG, tokenizer)
+
+    # 6. 训练组件初始化
+    # 优化器参数分组
+    param_groups = get_layer_wise_weight_decay_params(model, CONFIG)
+    # 优化器
+    optimizer = paddle.optimizer.AdamW(
+        parameters=param_groups,
+        learning_rate=CONFIG.base_lr,
+        beta1=0.9,
+        beta2=0.95,
+        epsilon=1e-8,
+        grad_clip=nn.ClipGradByGlobalNorm(CONFIG.max_grad_norm) if CONFIG.enable_grad_clip else None
+    )
+    # EMA初始化
+    ema = EMA(model, CONFIG.ema_decay) if CONFIG.enable_ema else None
+    # 梯度噪声注入器
+    grad_noise_injector = GradientNoiseInjector(CONFIG.grad_noise_eta, CONFIG.grad_noise_gamma)
+
+    # 加载断点续训
+    global_step, start_epoch, best_val_ppl = load_checkpoint(CONFIG, model, optimizer, ema)
+    # 训练全局变量
+    train_loss_accum = 0.0
+    grad_step_count = 0
+    early_stop_counter = 0
+
+    # 7. 正式训练主循环
+    LOGGER.info("="*100)
+    LOGGER.info("开始正式预训练主循环")
+    LOGGER.info("="*100)
+    for epoch in range(start_epoch, CONFIG.max_epochs):
+        model.train()
+        epoch_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{CONFIG.max_epochs}]")
+        for batch_idx, (x, y) in enumerate(epoch_bar):
+            # 更新学习率
+            current_lr = get_lr(global_step, total_train_steps, warmup_steps, CONFIG.base_lr, CONFIG.min_lr)
+            optimizer.set_lr(current_lr)
+
+            # 前向传播
+            logits, z_loss = model(x)
+            ce_loss = F.cross_entropy(logits.reshape([-1, tokenizer.vocab_size]), y.reshape([-1]))
+            loss = ce_loss + z_loss
+
+            # R-Drop正则
+            if CONFIG.enable_r_drop:
+                logits2, _ = model(x)
+                rd_loss = r_drop_loss(logits, logits2, CONFIG.r_drop_alpha)
+                loss = loss + rd_loss
+
+            # 梯度累积
+            loss = loss / CONFIG.gradient_accumulation_steps
+            loss.backward()
+
+            train_loss_accum += loss.numpy()[0]
+            grad_step_count += 1
+
+            # 达到累积步数更新参数
+            if grad_step_count % CONFIG.gradient_accumulation_steps == 0:
+                # 梯度噪声注入
+                if CONFIG.enable_grad_noise_injection:
+                    grad_noise_injector.inject(optimizer._parameter_list, global_step)
+
+                optimizer.step()
+                optimizer.clear_grad()
+
+                # EMA更新
+                if ema is not None:
+                    ema.update()
+
+                global_step += 1
+                avg_train_loss = train_loss_accum / CONFIG.gradient_accumulation_steps
+                train_ppl = np.exp(avg_train_loss)
+
+                # 日志打印
+                if global_step % CONFIG.log_interval == 0:
+                    metrics = {
+                        "train_loss": avg_train_loss,
+                        "train_ppl": train_ppl,
+                        "lr": current_lr
+                    }
+                    TRAIN_METRIC_MANAGER.log_metrics(global_step, epoch+1, metrics)
+                    epoch_bar.set_postfix({
+                        "loss": f"{avg_train_loss:.4f}",
+                        "ppl": f"{train_ppl:.2f}",
+                        "lr": f"{current_lr:.6f}"
+                    })
+
+                # 验证集评估
+                if global_step % CONFIG.val_interval == 0:
+                    val_loss, val_ppl = evaluate(model, val_loader, tokenizer.vocab_size, ema, CONFIG.max_val_batches)
+                    LOGGER.info(f"【验证】step:{global_step} | val_loss:{val_loss:.4f} | val_ppl:{val_ppl:.2f}")
+                    val_metrics = {"val_loss": val_loss, "val_ppl": val_ppl}
+                    TRAIN_METRIC_MANAGER.log_metrics(global_step, epoch+1, val_metrics)
+
+                    # 保存最优模型 + 早停判断
+                    if val_ppl < best_val_ppl - CONFIG.early_stop_min_delta:
+                        best_val_ppl = val_ppl
+                        early_stop_counter = 0
+                        save_checkpoint(CONFIG, model, optimizer, ema, tokenizer, global_step, epoch+1, best_val_ppl, is_best=True)
+                    else:
+                        early_stop_counter += 1
+                        LOGGER.info(f"早停计数器：{early_stop_counter}/{CONFIG.early_stop_patience}")
+                        if early_stop_counter >= CONFIG.early_stop_patience:
+                            LOGGER.info("验证集指标不再提升，触发早停，训练结束")
+                            raise KeyboardInterrupt
+
+                # 定期保存断点
+                if global_step % CONFIG.save_interval == 0:
+                    save_checkpoint(CONFIG, model, optimizer, ema, tokenizer, global_step, epoch+1, best_val_ppl, is_best=False)
+
+                # 清空累积
+                train_loss_accum = 0.0
+
+    # 8. 训练结束后测试集评估
+    LOGGER.info("="*100)
+    LOGGER.info("训练完成，开始测试集最终评估")
+    LOGGER.info("="*100)
+    test_loss, test_ppl = evaluate(model, test_loader, tokenizer.vocab_size, ema, CONFIG.max_test_batches)
+    LOGGER.info(f"【最终测试】test_loss:{test_loss:.4f} | test_ppl:{test_ppl:.2f}")
+    TEST_METRIC_MANAGER.log_metrics(global_step, CONFIG.max_epochs, {"test_loss": test_loss, "test_ppl": test_ppl})
+
+    # 保存最终完整模型
+    paddle.save(model.state_dict(), CONFIG.final_model_save_path)
+    LOGGER.info(f"最终模型已保存至：{CONFIG.final_model_save_path}")
+
+    # 结束wandb
+    if CONFIG.enable_wandb and WANDB_AVAILABLE:
+        wandb.finish()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        LOGGER.info("训练被手动终止，正在保存当前断点...")
+        save_checkpoint(CONFIG, model, optimizer, ema, tokenizer, global_step, start_epoch, best_val_ppl)
+        LOGGER.info("断点保存成功，程序退出")
+    except Exception as e:
+        LOGGER.error(f"训练异常崩溃：{traceback.format_exc()}")
